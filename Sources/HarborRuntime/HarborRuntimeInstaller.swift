@@ -143,6 +143,10 @@ public enum HarborRuntimeInstaller {
                 to: destination.appendingPathComponent(dir, isDirectory: true)
             )
         }
+        // The engine DMG may arrive via a browser download, and its files then carry
+        // com.apple.quarantine — Gatekeeper uses that to block mcpelauncher-webview's
+        // plugins at Microsoft sign-in ("Apple could not verify…"), so strip it.
+        stripQuarantine(at: destination)
         // gamecontrollerdb + preload libs live next to the runtime root under share/.
         let sharedRuntime = destination.appendingPathComponent("Resources/mcpelauncher", isDirectory: true)
         if fm.fileExists(atPath: sharedRuntime.path) {
@@ -162,6 +166,18 @@ public enum HarborRuntimeInstaller {
 
         guard fm.isExecutableFile(atPath: destination.appendingPathComponent("MacOS/mcpelauncher-client").path) else {
             throw HarborError.invalidPackage(reason: "mcpelauncher-client missing after launcher install")
+        }
+    }
+
+    /// Best-effort recursive removal of com.apple.quarantine — copyItem preserves
+    /// the attribute, and Gatekeeper blocks quarantined plugins at load time.
+    private static func stripQuarantine(at root: URL) {
+        var paths = [root.path]
+        if let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) {
+            while let url = enumerator.nextObject() as? URL { paths.append(url.path) }
+        }
+        for path in paths {
+            removexattr(path, "com.apple.quarantine", 0)
         }
     }
 

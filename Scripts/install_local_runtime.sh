@@ -28,6 +28,9 @@ cp -a "$APP/Frameworks/." "$DEST/Frameworks/"
 # Qt plugins are required by mcpelauncher-webview (Microsoft sign-in) — see Resources/qt.conf.
 cp -a "$APP/PlugIns/." "$DEST/PlugIns/"
 cp -a "$DEST/Resources/mcpelauncher" "$DEST/share/mcpelauncher"
+# A browser-downloaded DMG carries quarantine flags; Gatekeeper blocks the
+# sign-in webview's Qt plugins unless they are stripped.
+xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
 cat > "$DEST/runtime.json" <<EOF
 {
   "version" : "v1.8.4-573",

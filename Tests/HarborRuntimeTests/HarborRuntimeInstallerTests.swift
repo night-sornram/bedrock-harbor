@@ -124,6 +124,41 @@ final class HarborRuntimeInstallerTests: XCTestCase {
         XCTAssertTrue(LocalRuntimeDiscovery.isRuntimeRootUsable(root))
     }
 
+    func testDeployStripsQuarantineFromDeployedRuntime() throws {
+        let contents = try makeFakeAppContents()
+        // A browser-downloaded engine DMG carries com.apple.quarantine on its files.
+        // Gatekeeper then blocks the sign-in webview's plugins ("Apple could not
+        // verify…") when the game spawns mcpelauncher-webview — deploy must strip it.
+        let fm = FileManager.default
+        let sourcePaths = [
+            contents.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib").path,
+            contents.appendingPathComponent("MacOS/mcpelauncher-client").path,
+        ]
+        for path in sourcePaths {
+            XCTAssertTrue(try runXAttr(["-w", "com.apple.quarantine", "0081;00000000;Safari;test", path]))
+        }
+        let dest = tempDir.appendingPathComponent("harbor-mcpelauncher-test", isDirectory: true)
+
+        try HarborRuntimeInstaller.deploy(appContents: contents, destination: dest)
+
+        for source in sourcePaths {
+            let deployed = source.replacingOccurrences(of: contents.path, with: dest.path)
+            XCTAssertFalse(
+                try runXAttr(["-p", "com.apple.quarantine", deployed]),
+                "quarantine survived deploy: \(deployed)"
+            )
+        }
+    }
+
+    private func runXAttr(_ arguments: [String]) throws -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+        process.arguments = arguments
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+
     func testDeployRejectsNonAppBundle() throws {
         let notAnApp = tempDir.appendingPathComponent("Contents", isDirectory: true)
         try FileManager.default.createDirectory(at: notAnApp, withIntermediateDirectories: true)
