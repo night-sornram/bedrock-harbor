@@ -116,7 +116,7 @@ public enum BundledRuleset {
     public static let current = CompatibilityRuleset(
         revision: "bh-rules-2026.09.foundation",
         schemaVersion: 1,
-        publishedAt: Date(timeIntervalSince1970: 1_758_153_600),
+        publishedAt: Date(timeIntervalSince1970: 1_789_689_600),
         rules: [
             CompatibilityRule(
                 id: "arch.requires.arm64",

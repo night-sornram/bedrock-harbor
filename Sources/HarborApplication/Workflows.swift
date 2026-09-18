@@ -189,23 +189,22 @@ public actor GameSessionCoordinator {
         installation: InstalledMinecraft,
         runtime: RuntimeInstallation
     ) async throws -> LaunchSession {
-        guard active == nil else {
-            throw HarborError.gameRunning(profileID: profile.id)
-        }
+        guard active == nil else { throw HarborError.gameRunning(profileID: profile.id) }
         guard let launcher = services.runtimeLauncher else {
             throw HarborError.feasibilityGateIncomplete(reason: "Runtime launcher is not composed")
         }
+        let verified = try await Self.verifyInstallation(installation, services: services)
+        guard verified.integrity == .verified else {
+            throw HarborError.invalidPackage(
+                reason: "Game package not verified under \(installation.relativeGameDirectory). Place lib/arm64-v8a/libminecraftpe.so in BedrockHarbor/Installations."
+            )
+        }
         let owner = "session-\(UUID().uuidString)"
         try await services.leases.acquire(dataRootID: profile.dataRootID, owner: owner)
-
         do {
             _ = try await LaunchGateWorkflow(services: services)
-                .assertLaunchAllowed(profile: profile, installation: installation, runtime: runtime)
-            let plan = try await launcher.prepareLaunchPlan(
-                profile: profile,
-                installation: installation,
-                runtime: runtime
-            )
+                .assertLaunchAllowed(profile: profile, installation: verified, runtime: runtime)
+            let plan = try await launcher.prepareLaunchPlan(profile: profile, installation: verified, runtime: runtime)
             let session = try await launcher.start(plan: plan)
             active = ActiveSession(session: session, dataRootID: profile.dataRootID, leaseOwner: owner)
             return session
@@ -213,6 +212,32 @@ public actor GameSessionCoordinator {
             await services.leases.release(dataRootID: profile.dataRootID, owner: owner)
             throw error
         }
+    }
+
+    public static func verifyInstallation(
+        _ installation: InstalledMinecraft,
+        services: HarborServiceBundle
+    ) async throws -> InstalledMinecraft {
+        let gameDir = URL(fileURLWithPath: installation.relativeGameDirectory, isDirectory: true)
+        let lib = gameDir.appendingPathComponent("lib/arm64-v8a/libminecraftpe.so")
+        var updated = installation
+        if FileManager.default.isReadableFile(atPath: lib.path) {
+            updated.integrity = .verified
+            updated.packageReceipts = [lib.path]
+            if installation.providerID.rawValue == "missing-game" {
+                updated.providerID = ProviderID(rawValue: "harbor-install")
+            }
+        } else {
+            updated.integrity = .failed
+            updated.packageReceipts = []
+        }
+        if updated != installation {
+            var all = (try? await services.metadata.loadInstallations()) ?? []
+            if let idx = all.firstIndex(where: { $0.id == installation.id }) { all[idx] = updated }
+            else { all.append(updated) }
+            try? await services.metadata.saveInstallations(all)
+        }
+        return updated
     }
 
     public func requestStop() async throws {
@@ -282,12 +307,16 @@ public struct DiagnosticsWorkflow: Sendable {
         }
 
         let installations = (try? await services.metadata.loadInstallations()) ?? []
+            .filter { $0.providerID.rawValue != "missing-game" }
+        let verifiedInstalls = installations.filter { $0.integrity == .verified }
         findings.append(
             DoctorFinding(
                 id: "game.installations",
                 title: "Game installations",
-                detail: "\(installations.count) installation record(s)",
-                severity: installations.isEmpty ? .unknown : .ok
+                detail: verifiedInstalls.isEmpty
+                    ? "No verified game package under BedrockHarbor/Installations"
+                    : "\(verifiedInstalls.count) verified installation(s)",
+                severity: verifiedInstalls.isEmpty ? .warning : .ok
             )
         )
 
@@ -410,17 +439,21 @@ public struct FoundationDiagnosticsCollector: DiagnosticsCollecting {
 }
 
 public enum CompositionRoot {
-    public static func makeFoundationBundle(paths: HarborPaths? = nil) throws -> HarborServiceBundle {
+    public static func makeFoundationBundle(
+        paths: HarborPaths? = nil,
+        runtimeProvider: (any RuntimeProviding)? = nil,
+        runtimeLauncher: (any RuntimeLaunching)? = nil
+    ) throws -> HarborServiceBundle {
         let resolvedPaths = try paths ?? HarborPaths.live()
         try resolvedPaths.ensurePrivateDirectoryLayout()
         let metadata = FileMetadataRepository(directory: resolvedPaths.metadataDirectory)
-        let services = HarborServiceBundle(
+        return HarborServiceBundle(
             metadata: metadata,
             credentials: KeychainCredentialStore(),
             store: UnavailableStoreProvider(),
             downloads: NoOpDownloadManager(),
-            runtimeProvider: PlaceholderRuntimeProvider(),
-            runtimeLauncher: PlaceholderRuntimeLauncher(),
+            runtimeProvider: runtimeProvider ?? PlaceholderRuntimeProvider(),
+            runtimeLauncher: runtimeLauncher ?? PlaceholderRuntimeLauncher(),
             compatibility: RulesetEvaluator(),
             leases: DataRootLeaseCenter(),
             redactor: LogRedactor(
@@ -432,6 +465,5 @@ public enum CompositionRoot {
             ),
             paths: resolvedPaths
         )
-        return services
     }
 }

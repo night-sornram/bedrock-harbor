@@ -1,669 +1,718 @@
+import AppKit
 import Foundation
-import HarborDomain
 import HarborApplication
+import HarborDomain
+import HarborGooglePlay
 import SwiftUI
 
-// MARK: - Shared UI components
+// MARK: - Shared
 
-public struct StatusBadge: View {
+public struct StatusPill: View {
+    public enum Tone { case neutral, ok, warn, bad }
     public let text: String
     public let tone: Tone
-
-    public enum Tone {
-        case neutral, ok, warning, critical
-    }
-
     public init(_ text: String, tone: Tone) {
         self.text = text
         self.tone = tone
     }
-
     public var body: some View {
         Text(text)
             .font(.caption.weight(.semibold))
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
-            .background(background)
-            .foregroundStyle(foreground)
+            .background(bg)
+            .foregroundStyle(fg)
             .clipShape(Capsule())
-            .accessibilityLabel(text)
     }
-
-    private var background: Color {
+    private var bg: Color {
         switch tone {
         case .neutral: return Color.secondary.opacity(0.15)
-        case .ok: return Color.green.opacity(0.18)
-        case .warning: return Color.orange.opacity(0.2)
-        case .critical: return Color.red.opacity(0.2)
+        case .ok: return Color.green.opacity(0.2)
+        case .warn: return Color.orange.opacity(0.22)
+        case .bad: return Color.red.opacity(0.2)
         }
     }
-
-    private var foreground: Color {
+    private var fg: Color {
         switch tone {
-        case .neutral: return Color.secondary
-        case .ok: return Color.green
-        case .warning: return Color.orange
-        case .critical: return Color.red
+        case .neutral: return .secondary
+        case .ok: return .green
+        case .warn: return .orange
+        case .bad: return .red
         }
     }
 }
 
-public struct EmptyStateView: View {
+public struct StepRow: View {
+    public let n: Int
     public let title: String
-    public let message: String
-
-    public init(title: String, message: String) {
+    public let subtitle: String
+    public let done: Bool
+    public let active: Bool
+    public init(n: Int, title: String, subtitle: String, done: Bool, active: Bool) {
+        self.n = n
         self.title = title
-        self.message = message
+        self.subtitle = subtitle
+        self.done = done
+        self.active = active
     }
-
     public var body: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "shippingbox")
-                .font(.largeTitle)
-                .foregroundStyle(.secondary)
-            Text(title)
-                .font(.headline)
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 360)
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(done ? Color.green : (active ? Color.accentColor : Color.secondary.opacity(0.2)))
+                    .frame(width: 26, height: 26)
+                if done {
+                    Image(systemName: "checkmark")
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+                } else {
+                    Text("\(n)").font(.caption.bold())
+                        .foregroundStyle(active ? .white : .secondary)
+                }
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.headline)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
     }
 }
 
-// MARK: - Presentation models (@Observable; no SwiftUI property-wrapper macros)
+// MARK: - State
 
 @MainActor
 @Observable
-public final class HomePresentation {
+public final class AppState {
     public var profiles: [Profile] = []
     public var installations: [InstalledMinecraft] = []
     public var runtimes: [RuntimeInstallation] = []
     public var selectedProfileID: UUID?
-    public var report: CompatibilityReport?
-    public var statusMessage: String = "Ready"
-    public var doctorPreview: String = ""
+    public var status: String = ""
+    public var isGameRunning = false
+    public var isInstalling = false
+    public var signInBusy = false
+    public var playAccountLabel = ""
+    public var accounts: [AccountRecord] = []
+    public var needsOnboarding = true
+    public var doctorLines: [String] = []
 
     public let services: HarborServiceBundle
+    private var sessionCoordinator: GameSessionCoordinator?
+
+    private static let localAPKKey = "com.bedrockharbor.localapk.mode"
+    private static let onboardKey = "com.bedrockharbor.onboarding.completed"
 
     public init(services: HarborServiceBundle) {
         self.services = services
+        self.sessionCoordinator = GameSessionCoordinator(services: services)
+        self.needsOnboarding = !UserDefaults.standard.bool(forKey: Self.localAPKKey)
     }
 
     public var selectedProfile: Profile? {
-        profiles.first { $0.id == selectedProfileID } ?? profiles.first
+        profiles.first { $0.id == selectedProfileID }
+            ?? profiles.first { $0.selectedInstallationID != nil }
+            ?? profiles.first
     }
 
-    public var selectedInstallation: InstalledMinecraft? {
-        guard let profile = selectedProfile else { return nil }
-        return installations.first { $0.id == profile.selectedInstallationID }
+    public var gameInstallation: InstalledMinecraft? {
+        installations.first { $0.integrity == .verified }
+            ?? installations.first
     }
 
-    public var selectedRuntime: RuntimeInstallation? {
-        runtimes.first
+    public var runtime: RuntimeInstallation? { runtimes.first }
+
+    public var hasVerifiedGame: Bool { gameInstallation?.integrity == .verified }
+
+    public var isPlaySignedIn: Bool {
+        accounts.contains { $0.sessionState == .ready }
+    }
+
+    public var nextStep: Int {
+        if !isPlaySignedIn && !usedLocalAPK { return 1 }
+        if !hasVerifiedGame { return 2 }
+        return 3
+    }
+
+    public var usedLocalAPK: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.localAPKKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.localAPKKey) }
+    }
+
+    public func refreshGate() {
+        if isPlaySignedIn || usedLocalAPK {
+            needsOnboarding = false
+        } else {
+            needsOnboarding = true
+        }
     }
 
     public func reload() async {
         profiles = (try? await services.metadata.loadProfiles()) ?? []
         installations = (try? await services.metadata.loadInstallations()) ?? []
         runtimes = (try? await services.metadata.loadRuntimeInstallations()) ?? []
-        if selectedProfileID == nil {
-            selectedProfileID = profiles.first?.id
+        accounts = (try? await services.metadata.loadAccounts()) ?? []
+        if let ready = accounts.first(where: { $0.sessionState == .ready }) {
+            playAccountLabel = ready.accountLabel
         }
-        await refreshCompatibility()
-        statusMessage = "Loaded \(profiles.count) profile(s)"
+        if selectedProfileID == nil { selectedProfileID = profiles.first?.id }
+        refreshGate()
+        status = status.isEmpty ? readySummary() : status
     }
 
-    public func refreshCompatibility() async {
-        let gate = LaunchGateWorkflow(services: services)
-        report = try? await gate.evaluate(
-            profile: selectedProfile ?? Profile(name: "None"),
-            installation: selectedInstallation,
-            runtime: selectedRuntime
-        )
+    private func readySummary() -> String {
+        if !isPlaySignedIn && !usedLocalAPK { return "Step 1 — Sign in with Google Play" }
+        if !hasVerifiedGame { return "Step 2 — Install Minecraft" }
+        return "Step 3 — Launch"
+    }
+
+    public func completeOnboardingFromLogin() {
+        needsOnboarding = false
+        UserDefaults.standard.set(true, forKey: Self.onboardKey)
+        refreshGate()
+    }
+
+    public func useLocalAPK() {
+        usedLocalAPK = true
+        needsOnboarding = false
+        status = "Local APK mode — choose an owned .apk if install finds nothing"
+    }
+
+    public func resetSetup() {
+        usedLocalAPK = false
+        needsOnboarding = true
+        UserDefaults.standard.set(false, forKey: Self.onboardKey)
+        refreshGate()
+    }
+
+    // MARK: Actions
+
+    public func googleSignIn() async {
+        signInBusy = true
+        status = "Opening Google sign-in…"
+        GoogleSignInController.shared.present()
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            var token: NSObjectProtocol?
+            token = NotificationCenter.default.addObserver(forName: .bhGoogleSignInFinished, object: nil, queue: .main) { _ in
+                if let token { NotificationCenter.default.removeObserver(token) }
+                cont.resume()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 180) {
+                if let token { NotificationCenter.default.removeObserver(token) }
+                cont.resume()
+            }
+        }
+        if let email = GoogleSignInController.shared.signedInEmail {
+            playAccountLabel = email
+            let account = AccountRecord(
+                providerID: .googlePlay,
+                accountLabel: email,
+                sessionState: .ready,
+                keychainReference: "play-\(UUID().uuidString)"
+            )
+            accounts.removeAll { $0.providerID == .googlePlay }
+            accounts.append(account)
+            try? await services.metadata.saveAccounts(accounts)
+            completeOnboardingFromLogin()
+            status = "Signed in as \(email) — next: Install Minecraft"
+        } else {
+            status = "Google sign-in not finished — try again"
+        }
+        signInBusy = false
+        await reload()
+    }
+
+    public func installGame() async {
+        isInstalling = true
+        defer { isInstalling = false }
+
+        let local = await GamePackageAcquirer.acquire(services: services)
+        if let existing = local.installation, existing.integrity == .verified {
+            await reload()
+            status = "Minecraft \(existing.originalVersionName) ready — Launch"
+            return
+        }
+
+        status = "Checking Google Play…"
+        let auth = await PlaySessionStore.harvestFromWebKit(email: playAccountLabel.isEmpty ? nil : playAccountLabel)
+        if auth.cookies.isEmpty {
+            status = "No Google Play session — sign in with the account that owns Minecraft"
+            needsOnboarding = true
+            refreshGate()
+            return
+        }
+
+        let listing = await PlayStoreInspector().inspect(auth: auth)
+        status = listing.summary
+
+        if listing.showsOwned || listing.installOnDevices {
+            // Try delivery anyway; if Google blocks unofficial clients, explain owned + blocked.
+            status = "You already purchased — trying Play download for owned Minecraft…"
+        } else if listing.showsBuy && !listing.showsOwned {
+            status = "\(listing.summary). If you purchased Minecraft, sign in with that same Google account."
+            return
+        }
+
+        status = "Downloading Minecraft from Google Play…"
+        do {
+            let staging = services.paths.stagingCache
+                .appendingPathComponent("play-\(UUID().uuidString)", isDirectory: true)
+            let result = try await PlayDeliveryClient().downloadPackage(auth: auth, into: staging)
+            status = "Play download complete (\(result.fileCount) file(s)) — installing…"
+            let version = result.versionName == "unknown" ? "play-\(result.fileCount)parts" : result.versionName
+            let dest = GamePackageAcquirer.harborInstallRoot().appendingPathComponent(version, isDirectory: true)
+            try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+            let apks = ((try? FileManager.default.contentsOfDirectory(at: result.packageDirectory, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.pathExtension.lowercased() == "apk" }
+            if let extractor = findExtractor(), !apks.isEmpty {
+                let process = Process()
+                process.executableURL = extractor
+                process.arguments = apks.map(\.path) + [dest.path]
+                try process.run()
+                process.waitUntilExit()
+            } else if let first = apks.first {
+                _ = try await GamePackageAcquirer.extractAPK(first, services: services)
+                await reload()
+                status = "Installed from Play download"
+                return
+            } else {
+                status = ownedDeliveryBlockedMessage(listing)
+                return
+            }
+            let install = try await GamePackageAcquirer.importIntoHarbor(from: dest, services: services)
+            await reload()
+            status = "Installed from Google Play — \(install.originalVersionName)"
+        } catch {
+            if listing.showsOwned || listing.installOnDevices {
+                status = ownedDeliveryBlockedMessage(listing) + " Detail: \(error.localizedDescription)"
+            } else {
+                status = "Play install failed: \(error.localizedDescription) | \(listing.summary)"
+            }
+        }
+    }
+
+    private func ownedDeliveryBlockedMessage(_ listing: PlayStoreInspector.Listing) -> String {
+        """
+        Minecraft purchase is on this Play account (\(listing.summary)), but Google rejects Harbor's APK download \
+        (DF-DFERH-01 / unofficial client). Install Minecraft on an Android phone with this account, \
+        then use Install from APK / folder… — or keep waiting for a full Play client login in Harbor.
+        """
+    }
+
+    public func openPlayStoreListing() {
+        NSWorkspace.shared.open(PlayStoreInspector.detailsURL)
+        status = "Opened Minecraft on Google Play — you can install to an Android device from there"
+    }
+
+    private func findExtractor() -> URL? {
+        let runtimes = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BedrockHarbor/Runtimes", isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(at: runtimes, includingPropertiesForKeys: nil) else { return nil }
+        for entry in entries {
+            let tool = entry.appendingPathComponent("MacOS/mcpelauncher-extract")
+            if FileManager.default.isExecutableFile(atPath: tool.path) { return tool }
+        }
+        return nil
+    }
+
+    public func importAPK() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Select Minecraft .apk or a folder with lib/arm64-v8a/libminecraftpe.so"
+        panel.prompt = "Install"
+        guard panel.runModal() == .OK, let url = panel.url else {
+            status = "Install cancelled"
+            return
+        }
+        let services = self.services
+        Task {
+            do {
+                let install: InstalledMinecraft
+                if url.pathExtension.lowercased() == "apk" {
+                    install = try await GamePackageAcquirer.extractAPK(url, services: services)
+                } else {
+                    install = try await GamePackageAcquirer.importIntoHarbor(from: url, services: services)
+                }
+                await reload()
+                status = "Installed \(install.originalVersionName)"
+            } catch {
+                status = error.localizedDescription
+            }
+        }
+    }
+
+    public func launchGame() async {
+        if nextStep == 1 && !usedLocalAPK {
+            status = "Step 1 required — Sign in with Google Play"
+            return
+        }
+        if !hasVerifiedGame {
+            await installGame()
+            guard hasVerifiedGame else {
+                status = "Cannot launch — Minecraft package missing"
+                return
+            }
+        }
+        guard let profile = selectedProfile,
+              let installation = gameInstallation,
+              let runtime
+        else {
+            status = "Missing profile, game, or runtime"
+            return
+        }
+        let coordinator = sessionCoordinator ?? GameSessionCoordinator(services: services)
+        sessionCoordinator = coordinator
+        do {
+            let verified = try await GameSessionCoordinator.verifyInstallation(installation, services: services)
+            guard verified.integrity == .verified else {
+                status = "Game package not verified"
+                return
+            }
+            let session = try await coordinator.launch(profile: profile, installation: verified, runtime: runtime)
+            isGameRunning = true
+            status = "Game running (pid \(session.processIdentifier.map(String.init) ?? "?"))"
+        } catch {
+            isGameRunning = false
+            status = error.localizedDescription
+        }
+    }
+
+    public func stopGame() async {
+        guard let coordinator = sessionCoordinator else {
+            status = "Nothing to stop"
+            return
+        }
+        try? await coordinator.requestStop()
+        await coordinator.reconcileExited()
+        isGameRunning = false
+        status = "Stop requested"
     }
 
     public func runDoctor() async {
-        let snapshot = (try? await DiagnosticsWorkflow(services: services).collect()) ?? DiagnosticsSnapshot()
-        doctorPreview = snapshot.redactedSummary
-        statusMessage = "Doctor completed with \(snapshot.findings.count) finding(s)"
+        let snap = (try? await DiagnosticsWorkflow(services: services).collect()) ?? DiagnosticsSnapshot()
+        doctorLines = snap.findings.map { "\($0.severity.rawValue): \($0.title) — \($0.detail)" }
+        status = "Doctor: \(snap.findings.count) checks"
     }
 
-    public func launch() async {
-        statusMessage = "Feasibility gate incomplete — launch path is not live yet"
-    }
-}
-
-@MainActor
-@Observable
-public final class AccountsPresentation {
-    public var accounts: [AccountRecord] = []
-    public var statusMessage: String = "Store account ≠ Xbox game identity"
-    public let services: HarborServiceBundle
-
-    public init(services: HarborServiceBundle) {
-        self.services = services
-    }
-
-    public func reload() async {
-        accounts = (try? await services.metadata.loadAccounts()) ?? []
-    }
-
-    public func beginGoogleSignIn() async {
-        statusMessage = "Play sign-in is blocked until the feasibility gate provides a tested auth contract"
-    }
-}
-
-@MainActor
-@Observable
-public final class VersionsPresentation {
-    public var versions: [MinecraftVersion] = []
-    public var installations: [InstalledMinecraft] = []
-    public var statusMessage: String = ""
-    public let services: HarborServiceBundle
-
-    public init(services: HarborServiceBundle) {
-        self.services = services
-    }
-
-    public func reload() async {
-        installations = (try? await services.metadata.loadInstallations()) ?? []
-        if let store = services.store {
-            versions = (try? await store.listKnownVersions()) ?? []
-        } else {
-            versions = []
+    public func deleteProfile(_ profile: Profile) async {
+        if let workflow = ProfileWorkflow(services: services) as ProfileWorkflow? {
+            try? await workflow.delete(id: profile.id)
         }
-        statusMessage = "Known=\(versions.count) Installed=\(installations.count)"
+        await reload()
+        status = "Deleted profile \(profile.name)"
     }
 }
 
-@MainActor
-@Observable
-public final class ProfilesPresentation {
-    public var profiles: [Profile] = []
-    public var statusMessage: String = ""
-    public var newName: String = "Default"
-    public let services: HarborServiceBundle
-    private let workflow: ProfileWorkflow
+// MARK: - Onboarding (forced, simple)
 
-    public init(services: HarborServiceBundle) {
-        self.services = services
-        self.workflow = ProfileWorkflow(services: services)
-    }
+public struct OnboardingView: View {
+    public let app: AppState
+    public init(app: AppState) { self.app = app }
 
-    public func reload() async {
-        profiles = (try? await services.metadata.loadProfiles()) ?? []
-    }
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HarborCover(height: 120)
 
-    public func createProfile() async {
-        let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
-            statusMessage = "Profile name is required"
-            return
+            VStack(alignment: .leading, spacing: 14) {
+                StepRow(
+                    n: 1,
+                    title: "Sign in with Google Play",
+                    subtitle: "Required — account that owns Minecraft",
+                    done: app.isPlaySignedIn,
+                    active: app.nextStep == 1
+                )
+                StepRow(
+                    n: 2,
+                    title: "Install Minecraft",
+                    subtitle: "Harbor downloads or imports your game",
+                    done: app.hasVerifiedGame,
+                    active: app.nextStep == 2
+                )
+                StepRow(
+                    n: 3,
+                    title: "Launch",
+                    subtitle: "Start the game",
+                    done: app.isGameRunning,
+                    active: app.nextStep == 3
+                )
+            }
+            .padding()
+            .background(Color.secondary.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+
+            if !app.isPlaySignedIn {
+                Button {
+                    Task { await app.googleSignIn() }
+                } label: {
+                    HStack {
+                        if app.signInBusy { ProgressView() }
+                        Image(systemName: "person.crop.circle")
+                        Text("Sign in with Google Play")
+                            .font(.headline)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(app.signInBusy)
+            } else {
+                Text("Signed in as \(app.playAccountLabel.isEmpty ? "Google Play" : app.playAccountLabel)")
+                    .foregroundStyle(.green)
+                    .font(.headline)
+            }
+
+            Button("I have an APK — skip Play") {
+                app.useLocalAPK()
+            }
+            .buttonStyle(.link)
+            .font(.caption)
+
+            if !app.status.isEmpty {
+                Text(app.status)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
         }
-        do {
-            _ = try await workflow.create(name: name, installationID: nil, runtimeReleaseID: nil)
-            await reload()
-            statusMessage = "Created profile “\(name)” with isolated game data"
-        } catch {
-            statusMessage = error.localizedDescription
-        }
+        .padding(28)
+        .frame(maxWidth: 560, maxHeight: .infinity, alignment: .topLeading)
+        .task { await app.reload() }
     }
 }
 
-@MainActor
-@Observable
-public final class DiagnosticsPresentation {
-    public var snapshot: DiagnosticsSnapshot?
-    public var findings: [DoctorFinding] = []
-    public var statusMessage: String = ""
-    public let services: HarborServiceBundle
+// MARK: - Home
 
-    public init(services: HarborServiceBundle) {
-        self.services = services
-    }
+public struct HomeView: View {
+    public let app: AppState
+    public init(app: AppState) { self.app = app }
 
-    public func collect() async {
-        do {
-            let value = try await DiagnosticsWorkflow(services: services).collect()
-            snapshot = value
-            findings = value.findings
-            statusMessage = "Collected \(value.findings.count) findings"
-        } catch {
-            statusMessage = error.localizedDescription
+    public var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                HarborCover(height: 96)
+
+                // Progress
+                VStack(alignment: .leading, spacing: 12) {
+                    StepRow(n: 1, title: "Google Play", subtitle: app.isPlaySignedIn ? app.playAccountLabel : "Not signed in", done: app.isPlaySignedIn, active: app.nextStep == 1)
+                    StepRow(n: 2, title: "Minecraft", subtitle: app.hasVerifiedGame ? (app.gameInstallation?.originalVersionName ?? "") : "Not installed", done: app.hasVerifiedGame, active: app.nextStep == 2)
+                    StepRow(n: 3, title: "Game", subtitle: app.isGameRunning ? "Running" : "Not running", done: app.isGameRunning, active: app.nextStep == 3)
+                }
+                .padding()
+                .background(Color.secondary.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                // Primary action only
+                Group {
+                    switch app.nextStep {
+                    case 1:
+                        Button {
+                            Task { await app.googleSignIn() }
+                        } label: {
+                            Label("Sign in with Google Play", systemImage: "person.crop.circle")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(app.signInBusy)
+                    case 2:
+                        Button {
+                            Task { await app.installGame() }
+                        } label: {
+                            Label(
+                                app.isInstalling ? "Downloading from Play…" : "Install Minecraft from Play",
+                                systemImage: "icloud.and.arrow.down"
+                            )
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(app.isInstalling)
+                    default:
+                        HStack(spacing: 12) {
+                            Button {
+                                Task { await app.launchGame() }
+                            } label: {
+                                Label("Launch", systemImage: "play.fill")
+                                    .font(.headline)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 12)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            if app.isGameRunning {
+                                Button("Stop") {
+                                    Task { await app.stopGame() }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Status
+                if !app.status.isEmpty {
+                    HStack {
+                        StatusPill(app.status, tone: app.status.lowercased().contains("ready")
+                                   || app.status.lowercased().contains("running")
+                                   || app.status.lowercased().contains("signed")
+                                   ? .ok : (app.status.lowercased().contains("cannot") || app.status.lowercased().contains("missing") ? .bad : .neutral))
+                        Spacer()
+                    }
+                }
+
+                // Compact details
+                GroupBox("Details") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        LabeledContent("Profile", value: app.selectedProfile?.name ?? "—")
+                        LabeledContent("Runtime", value: app.runtime.map { "\($0.releaseID) [\($0.health.rawValue)]" } ?? "—")
+                        LabeledContent("Game", value: app.gameInstallation.map { "\($0.originalVersionName) [\($0.integrity.rawValue)]" } ?? "Not installed")
+                    }
+                    .padding(4)
+                }
+
+                // Secondary
+                HStack(spacing: 16) {
+                    Button("Open Minecraft on Play Store") { app.openPlayStoreListing() }
+                        .buttonStyle(.link)
+                    Button("Install from APK / folder…") { app.importAPK() }
+                        .buttonStyle(.link)
+                    Button("Run setup again") { app.resetSetup() }
+                        .buttonStyle(.link)
+                    Spacer()
+                }
+                .font(.caption)
+            }
+            .padding(24)
         }
+        .navigationTitle("BedrockHarbor")
+        .task { await app.reload() }
     }
 }
+
+// MARK: - Settings
+
+public struct SettingsView: View {
+    public let app: AppState
+    public init(app: AppState) { self.app = app }
+
+    public var body: some View {
+        Form {
+            Section("Account") {
+                LabeledContent("Google Play", value: app.isPlaySignedIn ? app.playAccountLabel : "Not signed in")
+                Button("Sign in again") {
+                    Task { await app.googleSignIn() }
+                }
+                Button("Show setup steps") {
+                    app.resetSetup()
+                }
+            }
+            Section("Doctor") {
+                Button("Run checks") {
+                    Task { await app.runDoctor() }
+                }
+                if !app.doctorLines.isEmpty {
+                    ForEach(app.doctorLines, id: \.self) { line in
+                        Text(line).font(.caption)
+                    }
+                }
+            }
+            Section("About") {
+                LabeledContent("App", value: "BedrockHarbor")
+                LabeledContent("License", value: "Apache-2.0")
+                Text("Unofficial project. Not affiliated with Mojang, Microsoft, or Google.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Settings")
+        .task { await app.reload() }
+    }
+}
+
+// MARK: - Root
 
 @MainActor
 @Observable
 public final class HarborRootModel {
-    public enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
+    public enum Item: String, CaseIterable, Identifiable, Hashable {
         case home = "Home"
-        case versions = "Versions"
-        case profiles = "Profiles"
-        case worlds = "Worlds"
-        case diagnostics = "Diagnostics"
-        case accounts = "Accounts"
         case settings = "Settings"
-
         public var id: String { rawValue }
-
-        public var systemImage: String {
+        public var icon: String {
             switch self {
             case .home: return "house"
-            case .versions: return "shippingbox"
-            case .profiles: return "person.2"
-            case .worlds: return "globe"
-            case .diagnostics: return "stethoscope"
-            case .accounts: return "person.crop.circle"
             case .settings: return "gearshape"
             }
         }
     }
 
-    public var selection: SidebarItem = .home
-    public var home: HomePresentation
-    public var accounts: AccountsPresentation
-    public var versions: VersionsPresentation
-    public var profiles: ProfilesPresentation
-    public var diagnostics: DiagnosticsPresentation
+    public var selection: Item = .home
+    public let app: AppState
 
     public init(services: HarborServiceBundle) {
-        self.home = HomePresentation(services: services)
-        self.accounts = AccountsPresentation(services: services)
-        self.versions = VersionsPresentation(services: services)
-        self.profiles = ProfilesPresentation(services: services)
-        self.diagnostics = DiagnosticsPresentation(services: services)
+        self.app = AppState(services: services)
     }
 }
-
-// MARK: - Screens
-
-public struct HomeView: View {
-    public let model: HomePresentation
-
-    public init(model: HomePresentation) {
-        self.model = model
-    }
-
-    public var body: some View {
-        List {
-            Section("Session") {
-                LabeledContent("Profile", value: model.selectedProfile?.name ?? "None")
-                LabeledContent(
-                    "Game version",
-                    value: model.selectedInstallation.map { "\($0.originalVersionName) (\($0.buildID.abi.rawValue))" } ?? "Not installed"
-                )
-                LabeledContent(
-                    "Runtime",
-                    value: model.selectedRuntime.map { "\($0.releaseID) [\($0.health.rawValue)]" } ?? "Not installed"
-                )
-            }
-
-            Section("Compatibility") {
-                if let report = model.report {
-                    HStack {
-                        Text(report.overall.rawValue.capitalized)
-                        StatusBadge(
-                            report.launchBlocked ? "Launch blocked" : "Launch not blocked",
-                            tone: report.launchBlocked ? .critical : .ok
-                        )
-                    }
-                    Text("Ruleset \(report.rulesetRevision)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    ForEach(report.capabilities) { capability in
-                        HStack {
-                            Text(capability.group.rawValue)
-                            Spacer()
-                            StatusBadge(capability.status.rawValue, tone: tone(for: capability.status))
-                        }
-                    }
-                    ForEach(report.warnings, id: \.self) { warning in
-                        Text(warning)
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                } else {
-                    Text("No compatibility report yet.")
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section("Actions") {
-                Button("Reload") {
-                    Task { await model.reload() }
-                }
-                Button("Launch") {
-                    Task { await model.launch() }
-                }
-                Button("Run Doctor") {
-                    Task { await model.runDoctor() }
-                }
-            }
-
-            if !model.doctorPreview.isEmpty {
-                Section("Doctor preview (redacted)") {
-                    Text(model.doctorPreview)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                }
-            }
-        }
-        .navigationTitle("BedrockHarbor")
-        .task { await model.reload() }
-        .safeAreaInset(edge: .bottom) {
-            HStack {
-                Text(model.statusMessage)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            .padding(8)
-            .background(.bar)
-        }
-    }
-
-    private func tone(for status: CompatibilityStatus) -> StatusBadge.Tone {
-        switch status {
-        case .compatible: return .ok
-        case .partiallyCompatible: return .warning
-        case .unknown: return .neutral
-        case .unsupported: return .critical
-        }
-    }
-}
-
-public struct AccountsView: View {
-    public let model: AccountsPresentation
-
-    public init(model: AccountsPresentation) {
-        self.model = model
-    }
-
-    public var body: some View {
-        List {
-            Section("Concepts") {
-                Text("Store account authorizes Minecraft acquisition via Google Play. Game identity (Xbox/Microsoft) is separate and is not implied by store sign-in.")
-                    .font(.callout)
-            }
-            Section("Accounts") {
-                if model.accounts.isEmpty {
-                    Text("No store accounts yet.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(model.accounts) { account in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(account.accountLabel)
-                            Text(account.sessionState.rawValue)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-            Section {
-                Button("Sign in with Google Play") {
-                    Task { await model.beginGoogleSignIn() }
-                }
-            }
-        }
-        .navigationTitle("Accounts")
-        .task { await model.reload() }
-        .safeAreaInset(edge: .bottom) {
-            Text(model.statusMessage)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-                .background(.bar)
-        }
-    }
-}
-
-public struct VersionsView: View {
-    public let model: VersionsPresentation
-
-    public init(model: VersionsPresentation) {
-        self.model = model
-    }
-
-    public var body: some View {
-        List {
-            Section("Installed") {
-                if model.installations.isEmpty {
-                    EmptyStateView(
-                        title: "No installations",
-                        message: "Installs require entitlement + delivery resolution after the feasibility gate."
-                    )
-                } else {
-                    ForEach(model.installations) { item in
-                        VStack(alignment: .leading) {
-                            Text(item.originalVersionName)
-                            Text(item.buildID.description)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-            Section("Catalog") {
-                ForEach(model.versions) { version in
-                    VStack(alignment: .leading) {
-                        Text(version.displayName)
-                        Text("\(version.availability.rawValue) · \(version.provenance.rawValue)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-        }
-        .navigationTitle("Versions")
-        .task { await model.reload() }
-        .safeAreaInset(edge: .bottom) {
-            Text(model.statusMessage)
-                .font(.caption)
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.bar)
-        }
-    }
-}
-
-public struct ProfilesView: View {
-    public let model: ProfilesPresentation
-
-    public init(model: ProfilesPresentation) {
-        self.model = model
-    }
-
-    public var body: some View {
-        List {
-            Section("Profiles") {
-                if model.profiles.isEmpty {
-                    Text("Each profile gets its own game data root.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(model.profiles) { profile in
-                        VStack(alignment: .leading) {
-                            Text(profile.name)
-                            Text("data-root \(profile.dataRootID)")
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-            Section("Create") {
-                TextField(
-                    "Profile name",
-                    text: Binding(
-                        get: { model.newName },
-                        set: { model.newName = $0 }
-                    )
-                )
-                Button("Create isolated profile") {
-                    Task { await model.createProfile() }
-                }
-            }
-        }
-        .navigationTitle("Profiles")
-        .task { await model.reload() }
-        .safeAreaInset(edge: .bottom) {
-            Text(model.statusMessage)
-                .font(.caption)
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.bar)
-        }
-    }
-}
-
-public struct WorldsView: View {
-    public init() {}
-
-    public var body: some View {
-        EmptyStateView(
-            title: "Worlds",
-            message: "World discovery is read-only and appears after profiles have game data. Backups require the game to be stopped and the data-root lease held."
-        )
-        .navigationTitle("Worlds")
-    }
-}
-
-public struct DiagnosticsView: View {
-    public let model: DiagnosticsPresentation
-
-    public init(model: DiagnosticsPresentation) {
-        self.model = model
-    }
-
-    public var body: some View {
-        List {
-            Section("Doctor") {
-                Button("Collect findings") {
-                    Task { await model.collect() }
-                }
-                if let snapshot = model.snapshot {
-                    Text(snapshot.redactedSummary)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                }
-            }
-            Section("Findings") {
-                ForEach(model.findings) { finding in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(finding.title)
-                            Spacer()
-                            StatusBadge(finding.severity.rawValue, tone: tone(finding.severity))
-                        }
-                        Text(finding.detail)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            Section("Export") {
-                Text("Diagnostic export previews redacted content before saving. Uploads are never automatic.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .navigationTitle("Diagnostics")
-        .safeAreaInset(edge: .bottom) {
-            Text(model.statusMessage)
-                .font(.caption)
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.bar)
-        }
-    }
-
-    private func tone(_ severity: DoctorFinding.Severity) -> StatusBadge.Tone {
-        switch severity {
-        case .ok: return .ok
-        case .warning: return .warning
-        case .critical: return .critical
-        case .unknown: return .neutral
-        }
-    }
-}
-
-public struct SettingsView: View {
-    public init() {}
-
-    public var body: some View {
-        Form {
-            Section("About") {
-                LabeledContent("Application", value: "BedrockHarbor")
-                LabeledContent("License", value: "Apache-2.0")
-                LabeledContent("Target", value: "macOS 14+, Apple Silicon")
-            }
-            Section("Unofficial project") {
-                Text("BedrockHarbor is an unofficial project and is not affiliated with Mojang, Microsoft, or Google.")
-                    .font(.footnote)
-            }
-            Section("Security") {
-                Text("Credentials stay in the macOS login Keychain. Secrets are excluded from metadata, logs, and diagnostic exports by default.")
-                    .font(.footnote)
-            }
-            Section("Updates") {
-                Text("Sparkle will update BedrockHarbor only. Runtime artifacts are managed separately from approved upstream sources.")
-                    .font(.footnote)
-            }
-        }
-        .navigationTitle("Settings")
-        .formStyle(.grouped)
-    }
-}
-
-// MARK: - Root split view
 
 public struct HarborRootView: View {
     public let model: HarborRootModel
+    private let app: AppState
 
     public init(services: HarborServiceBundle) {
         self.model = HarborRootModel(services: services)
+        self.app = model.app
     }
 
     public init(model: HarborRootModel) {
         self.model = model
+        self.app = model.app
     }
 
     public var body: some View {
-        NavigationSplitView {
-            List(HarborRootModel.SidebarItem.allCases, selection: Binding(
-                get: { model.selection },
-                set: { if let value = $0 { model.selection = value } }
-            )) { item in
-                Label(item.rawValue, systemImage: item.systemImage)
-                    .tag(item)
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-        } detail: {
-            switch model.selection {
-            case .home:
-                HomeView(model: model.home)
-            case .versions:
-                VersionsView(model: model.versions)
-            case .profiles:
-                ProfilesView(model: model.profiles)
-            case .worlds:
-                WorldsView()
-            case .diagnostics:
-                DiagnosticsView(model: model.diagnostics)
-            case .accounts:
-                AccountsView(model: model.accounts)
-            case .settings:
-                SettingsView()
+        Group {
+            if app.needsOnboarding {
+                OnboardingView(app: app)
+            } else {
+                NavigationSplitView {
+                    VStack(spacing: 0) {
+                        // Logo once at top — not on every nav row
+                        HStack(spacing: 10) {
+                            HarborLogo(size: 28)
+                            Text("BedrockHarbor")
+                                .font(.headline)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+
+                        Divider()
+
+                        List(HarborRootModel.Item.allCases, selection: Binding(
+                            get: { model.selection },
+                            set: { if let v = $0 { model.selection = v } }
+                        )) { item in
+                            Label(item.rawValue, systemImage: item.icon)
+                                .tag(item)
+                        }
+                        .listStyle(.sidebar)
+                    }
+                    .navigationSplitViewColumnWidth(min: 170, ideal: 190)
+                } detail: {
+                    switch model.selection {
+                    case .home:
+                        HomeView(app: app)
+                    case .settings:
+                        SettingsView(app: app)
+                    }
+                }
             }
         }
-        .frame(minWidth: 900, minHeight: 600)
+        .frame(minWidth: 800, minHeight: 520)
+        .task {
+            await app.reload()
+            app.refreshGate()
+        }
     }
 }

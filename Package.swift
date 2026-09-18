@@ -54,7 +54,7 @@ let package = Package(
         ),
         .target(
             name: "HarborFeatures",
-            dependencies: ["HarborDomain", "HarborApplication"],
+            dependencies: ["HarborDomain", "HarborApplication", "HarborGooglePlay"],
             path: "Sources/HarborFeatures"
         ),
         .executableTarget(
