@@ -92,6 +92,24 @@ final class HarborRuntimeInstallerTests: XCTestCase {
         )
     }
 
+    func testDeployWritesExecutableSideQtConfSoWebviewFindsQmlModules() throws {
+        let contents = try makeFakeAppContents()
+        let dest = tempDir.appendingPathComponent("harbor-mcpelauncher-test", isDirectory: true)
+
+        try HarborRuntimeInstaller.deploy(appContents: contents, destination: dest)
+
+        // mcpelauncher-webview (Xbox sign-in) aborts with "module QtQuick.Controls
+        // is not installed" unless a qt.conf next to the executable anchors the
+        // prefix at the runtime root — the bundle's Resources/qt.conf alone is not
+        // consulted for QML imports when the binary runs outside a real app bundle.
+        let expected = "[Paths]\nPrefix = ..\nPlugins = PlugIns\nImports = Resources/qml\nQmlImports = Resources/qml\n"
+        let actual = try String(
+            contentsOf: dest.appendingPathComponent("MacOS/qt.conf"),
+            encoding: .utf8
+        )
+        XCTAssertEqual(actual, expected)
+    }
+
     func testDeployRejectsBundleWithoutPlugIns() throws {
         let contents = try makeFakeAppContents()
         try FileManager.default.removeItem(at: contents.appendingPathComponent("PlugIns"))
@@ -118,6 +136,16 @@ final class HarborRuntimeInstallerTests: XCTestCase {
         try fm.createDirectory(at: root.appendingPathComponent("PlugIns/platforms"), withIntermediateDirectories: true)
         try "plugin".write(
             to: root.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib"),
+            atomically: true,
+            encoding: .utf8
+        )
+        // PlugIns without the executable-side qt.conf still yield a sign-in webview
+        // that cannot resolve its QML modules — require the fix so pre-fix runtimes
+        // self-heal instead of failing Xbox login with Llama 0x80070057.
+        XCTAssertFalse(LocalRuntimeDiscovery.isRuntimeRootUsable(root))
+
+        try "[Paths]\nPrefix = ..\n".write(
+            to: root.appendingPathComponent("MacOS/qt.conf"),
             atomically: true,
             encoding: .utf8
         )

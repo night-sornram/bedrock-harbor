@@ -143,6 +143,16 @@ public enum HarborRuntimeInstaller {
                 to: destination.appendingPathComponent(dir, isDirectory: true)
             )
         }
+        // mcpelauncher-webview (Microsoft sign-in) runs outside a real app bundle and
+        // then never applies Resources/qt.conf to its QML import path — it dies with
+        // "module QtQuick.Controls is not installed" (in-game: Llama 0x80070057).
+        // A qt.conf next to the executable with the prefix pinned to the runtime root
+        // restores the same paths the bundle layout would give.
+        try "[Paths]\nPrefix = ..\nPlugins = PlugIns\nImports = Resources/qml\nQmlImports = Resources/qml\n".write(
+            to: destination.appendingPathComponent("MacOS/qt.conf"),
+            atomically: true,
+            encoding: .utf8
+        )
         // The engine DMG may arrive via a browser download, and its files then carry
         // com.apple.quarantine — Gatekeeper uses that to block mcpelauncher-webview's
         // plugins at Microsoft sign-in ("Apple could not verify…"), so strip it.

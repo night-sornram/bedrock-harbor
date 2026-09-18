@@ -27,6 +27,9 @@ cp -a "$APP/Resources/." "$DEST/Resources/"
 cp -a "$APP/Frameworks/." "$DEST/Frameworks/"
 # Qt plugins are required by mcpelauncher-webview (Microsoft sign-in) — see Resources/qt.conf.
 cp -a "$APP/PlugIns/." "$DEST/PlugIns/"
+# The webview also needs a qt.conf next to the executables: outside a real app
+# bundle Resources/qt.conf is not applied to QML imports (Llama 0x80070057).
+printf '[Paths]\nPrefix = ..\nPlugins = PlugIns\nImports = Resources/qml\nQmlImports = Resources/qml\n' > "$DEST/MacOS/qt.conf"
 cp -a "$DEST/Resources/mcpelauncher" "$DEST/share/mcpelauncher"
 # A browser-downloaded DMG carries quarantine flags; Gatekeeper blocks the
 # sign-in webview's Qt plugins unless they are stripped.

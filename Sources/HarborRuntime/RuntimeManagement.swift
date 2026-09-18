@@ -138,13 +138,18 @@ public struct LocalRuntimeDiscovery: Sendable {
 
     /// A runtime root only counts when the sign-in webview can actually start:
     /// mcpelauncher-webview aborts at launch without the Qt cocoa platform plugin,
-    /// which surfaces in-game as Microsoft login error Llama (0x80070057).
+    /// and without the executable-side qt.conf it cannot resolve its QML modules
+    /// (QtQuick.Controls etc.) — both surface in-game as Microsoft login error
+    /// Llama (0x80070057).
     public static func isRuntimeRootUsable(_ root: URL) -> Bool {
         let fm = FileManager.default
         guard fm.isExecutableFile(atPath: root.appendingPathComponent("MacOS/mcpelauncher-client").path) else {
             return false
         }
-        return fm.fileExists(atPath: root.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib").path)
+        guard fm.fileExists(atPath: root.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib").path) else {
+            return false
+        }
+        return fm.fileExists(atPath: root.appendingPathComponent("MacOS/qt.conf").path)
     }
 
     public static func harborRuntimeRoots() -> [URL] {
