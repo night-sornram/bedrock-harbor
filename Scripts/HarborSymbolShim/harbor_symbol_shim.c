@@ -39,6 +39,21 @@ typedef struct { long quot; long rem; } harbor_ldiv_t;
 typedef struct { long long quot; long long rem; } harbor_lldiv_t;
 typedef struct { int quot; int rem; } harbor_div_t;
 
+/*
+ * pthread_sigmask: the macOS bionic libc shim does not export this symbol at all
+ * (upstream mcpelauncher-manifest issue #2030), so Bedrock 1.26.50+ fails to load.
+ * We provide kernel-semantics-compatible behavior: report an empty previous mask.
+ * The game only uses it to (un)block signals during startup and shutdown sections.
+ */
+__attribute__((visibility("default")))
+int pthread_sigmask(int how, const void *set, void *oldset) {
+    if (oldset != 0) {
+        unsigned long *old = (unsigned long *)oldset;
+        old[0] = 0;
+    }
+    return 0;
+}
+
 __attribute__((visibility("default")))
 harbor_ldiv_t ldiv(long numer, long denom) {
     harbor_ldiv_t r;
@@ -109,6 +124,7 @@ void mod_preinit(void) {
     void *libc = dlopen("libc.so", HARBOR_RTLD_NOLOAD);
     if (libc == 0)
         return;
+    relocate(libc, "pthread_sigmask", (void *)&pthread_sigmask);
     relocate(libc, "ldiv", (void *)&ldiv);
     relocate(libc, "lldiv", (void *)&lldiv);
     relocate(libc, "div", (void *)&div);

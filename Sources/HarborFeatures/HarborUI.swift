@@ -850,14 +850,29 @@ public struct SettingsView: View {
             Section("About") {
                 LabeledContent("App", value: "BedrockHarbor")
                 LabeledContent("License", value: "Apache-2.0")
-                Text("Unofficial project. Not affiliated with Mojang, Microsoft, or Google.")
-                    .font(.footnote)
+            }
+            Section("Credits") {
+                Text(creditsText)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
             }
         }
         .formStyle(.grouped)
         .navigationTitle("Settings")
         .task { await app.reload() }
+    }
+
+    private var creditsText: String {
+        """
+        Runtime: minecraft-linux/mcpelauncher (macOS build), GPL-3.0
+        Compatibility mod: minecraft-linux/mcpelauncher-updates via mcpelauncher-moddb
+        Symbol shim & libc repair: BedrockHarbor, Apache-2.0
+        Google Play client: BedrockHarbor independent client
+        Game packages: user-owned imports; downloads via the official Minecraft Bedrock Launcher
+
+        BedrockHarbor is not affiliated with Mojang, Microsoft, Google, or the minecraft-linux maintainers.
+        """
     }
 }
 

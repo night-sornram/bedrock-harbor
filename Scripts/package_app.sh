@@ -10,7 +10,7 @@ swift build --package-path "$ROOT"
 test -x "$BIN"
 
 mkdir -p "$ASSETS"
-if [ -f "$SRC_LOGO" ]; then
+if [ -n "${SRC_LOGO:-}" ] && [ -f "$SRC_LOGO" ]; then
   cp -f "$SRC_LOGO" "$ASSETS/BedrockHarbor.png"
 fi
 LOGO="$ASSETS/BedrockHarbor.png"
