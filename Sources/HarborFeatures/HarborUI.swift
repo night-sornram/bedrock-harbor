@@ -893,6 +893,18 @@ public struct SettingsView: View {
                     }
                 }
             }
+            Section("Xbox / Microsoft sign-in help") {
+                Text("""
+                If the in-game Microsoft sign-in gets stuck on "Face, fingerprint, PIN or security key", \
+                Microsoft is asking for a passkey that the game's login window cannot open \
+                (Microsoft blocks passkeys in embedded login windows). Fix it once on the account: \
+                open account.microsoft.com → Security → Ways to prove your identity → delete the passkey, \
+                then sign in again — the game will ask for your password instead and finish normally.
+                """)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            }
             Section("About") {
                 LabeledContent("App", value: "BedrockHarbor")
                 LabeledContent("License", value: "Apache-2.0")

@@ -115,18 +115,6 @@ public struct MCLauncherClientLayout: Sendable, Hashable {
         let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         env["PATH"] = macosDir + ":" + path
         env["HOME"] = FileManager.default.homeDirectoryForCurrentUser.path
-        // The Xbox sign-in webview (mcpelauncher-webview, QtWebEngine) exposes the
-        // WebAuthn API but has no platform authenticator on macOS, so Microsoft's
-        // "Face, fingerprint, PIN or security key" challenge hangs forever. Hiding
-        // the API makes Microsoft's page offer password sign-in instead. Applies to
-        // the webview too — it is spawned by the client and inherits the env.
-        let webAuthnOff = "--disable-blink-features=WebAuthentication"
-        let existingFlags = env["QTWEBENGINE_CHROMIUM_FLAGS"] ?? ""
-        if !existingFlags.contains(webAuthnOff) {
-            env["QTWEBENGINE_CHROMIUM_FLAGS"] = existingFlags.isEmpty
-                ? webAuthnOff
-                : existingFlags + " " + webAuthnOff
-        }
         for (k, v) in extra { env[k] = v }
         return env
     }
