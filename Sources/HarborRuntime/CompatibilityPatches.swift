@@ -12,8 +12,10 @@ import HarborDomain
 /// `patches/v1.26.0.2/arm64-v8a/libmaesdk.so` applies to game 1.26.0.2 only). No part of the
 /// official launcher copies those files into the game directory, and doing so corrupts the
 /// package (a mismatched libmaesdk crashes startup in the auth/HttpClient path). Harbor never
-/// copies game libraries; before launch it restores any previously patched library from its
-/// `.so.bck` backup so the package stays pristine.
+/// copies those version-pinned files; before launch it restores any previously swapped
+/// library from its `.so.bck` backup so the package stays pristine. The one in-place game
+/// binary edit Harbor makes is `StorageQueryCompatibilityPatch` (four bytes, `.so.orig`
+/// backup) — see its documentation for why the game itself must be patched.
 public struct HarborCompatibilityPatches: Sendable {
     public static let modDBURL = URL(string: "https://raw.githubusercontent.com/minecraft-linux/mcpelauncher-moddb/main/moddb.json")!
     public static let abi = "arm64-v8a"
@@ -510,6 +512,7 @@ public struct HarborCompatibilityPatches: Sendable {
         let modDir = try await ensureInstalled(gameVersionName: versionName)
         guard let versionName, let meta = loadMetadata() else {
             restorePatchedGameLibraries(gameDirectory: gameDirectory)
+            _ = StorageQueryCompatibilityPatch.patch(gameDirectory: gameDirectory)
             return modDir
         }
 
@@ -523,6 +526,7 @@ public struct HarborCompatibilityPatches: Sendable {
             restorePatchedGameLibraries(gameDirectory: gameDirectory)
             applyUniversalGameLibraries(modDirectory: modDir, gameDirectory: gameDirectory)
             applyVersionPinnedRebuilds(modDirectory: modDir, gameDirectory: gameDirectory)
+            _ = StorageQueryCompatibilityPatch.patch(gameDirectory: gameDirectory)
             return nil
         }
 
@@ -539,6 +543,7 @@ public struct HarborCompatibilityPatches: Sendable {
             )
         }
         restorePatchedGameLibraries(gameDirectory: gameDirectory)
+        _ = StorageQueryCompatibilityPatch.patch(gameDirectory: gameDirectory)
         return modDir
     }
 }

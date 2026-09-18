@@ -148,6 +148,7 @@ public struct Elf64: Sendable {
         public var type: UInt32
         public var offset: Int
         public var size: Int
+        public var address: Int = 0
     }
 
     public struct Symbol: Sendable {
@@ -187,10 +188,10 @@ public struct Elf64: Sendable {
               shoff + shnum * shentsize <= data.count
         else { return nil }
 
-        func sectionHeader(_ i: Int) -> (nameOff: Int, type: Int, offset: Int, size: Int)? {
+        func sectionHeader(_ i: Int) -> (nameOff: Int, type: Int, addr: Int, offset: Int, size: Int)? {
             let base = shoff + i * shentsize
             guard base + 64 <= data.count else { return nil }
-            return (u32(base), u32(base + 4), u64(base + 0x18), u64(base + 0x20))
+            return (u32(base), u32(base + 4), u64(base + 0x10), u64(base + 0x18), u64(base + 0x20))
         }
         guard let strtabHeader = sectionHeader(shstrndx) else { return nil }
         func sectionName(_ nameOff: Int) -> String {
@@ -204,7 +205,7 @@ public struct Elf64: Sendable {
         var elf = Elf64()
         for i in 0..<shnum {
             guard let h = sectionHeader(i) else { return nil }
-            elf.sections.append(Section(name: sectionName(h.nameOff), type: UInt32(h.type), offset: h.offset, size: h.size))
+            elf.sections.append(Section(name: sectionName(h.nameOff), type: UInt32(h.type), offset: h.offset, size: h.size, address: h.addr))
         }
         return elf
     }
