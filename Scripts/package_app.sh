@@ -4,7 +4,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/.build/out/Products/Debug/BedrockHarbor"
 APP="${1:-/Applications/BedrockHarbor.app}"
 ID="com.bedrockharbor.app"
-SRC_LOGO="/Users/night/Downloads/BedrockHarbor.png"
 ASSETS="$ROOT/Assets"
 
 swift build --package-path "$ROOT"
