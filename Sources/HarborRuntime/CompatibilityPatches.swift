@@ -128,7 +128,7 @@ public struct HarborCompatibilityPatches: Sendable {
         names.max { compareVersions(versionComponents($0), versionComponents($1)) < 0 }
     }
 
-    // MARK: - Known incompatibilities
+    // MARK: - Known-broken official mod ranges
 
     public struct KnownIncompatibility: Sendable {
         public let gameVersionMin: String
@@ -137,19 +137,24 @@ public struct HarborCompatibilityPatches: Sendable {
         public let reason: String
     }
 
-    /// Empirically verified 2026-09-18 on macOS arm64 (macos-builder v1.8.4-573 + every
-    /// mcpelauncher-updates release published so far, asset v26.40.1): Bedrock 1.26.50–1.26.51
-    /// load, then crash during startup inside the mod's HttpClient hook (recursive
-    /// shim::pthread_mutex_lock → SIGSEGV), even though moddb's `provides` claims support.
-    /// Without the mod the game does not load at all (missing pthread_sigmask). Each rule
-    /// applies only while the resolved mod release is at or below `modVersionMaxInclusive`,
-    /// so the block lifts automatically once upstream ships a newer, hopefully fixed, mod.
+    /// Empirically verified 2026-09-18 on macOS arm64 (macos-builder v1.8.4-573 +
+    /// mcpelauncher-updates asset v26.40.1, newest upstream at the time): Bedrock
+    /// 1.26.50–1.26.51 crash during startup inside the official mod's pairip/HttpClient hook
+    /// (recursive shim::pthread_mutex_lock → SIGSEGV), even though moddb claims support.
+    /// For these versions Harbor bypasses the official mod entirely and applies its own
+    /// compatibility stack: guest libc hash repair (GuestLibcCompatibilityPatch), the
+    /// freestanding symbol shim mod (ldiv & fortify family), and the patch bundle's universal
+    /// game libraries (rebuilt libPlayFabMultiplayer.so — the bundled one crashes in its
+    /// static constructors on the macOS shim). Verified: Minecraft 1.26.51.1 loads and runs
+    /// stably with that stack. Entries apply only while the resolved mod release is at or
+    /// below `modVersionMaxInclusive`, so Harbor returns to the official mod automatically
+    /// once a fixed release ships.
     public static let knownIncompatibilities: [KnownIncompatibility] = [
         KnownIncompatibility(
             gameVersionMin: "1.26.50",
             gameVersionMax: "1.26.51",
             modVersionMaxInclusive: "1.26.45.1",
-            reason: "loads but crashes during startup with every mcpelauncher-updates release published so far (verified with Minecraft 1.26.51.1 on the newest macOS runtime)"
+            reason: "official mcpelauncher-updates mod crashes during startup (verified with Minecraft 1.26.51.1)"
         ),
     ]
 
@@ -184,6 +189,70 @@ public struct HarborCompatibilityPatches: Sendable {
             }
         }
         return nil
+    }
+
+    // MARK: - Harbor compat stack (official mod bypassed)
+
+    /// Universal replacement libraries from the official patch bundle: root-level `patches/*.so`
+    /// apply to any game version (version-pinned `patches/v*/` folders are the official mod's
+    /// business and are never touched here). The rebuilt libPlayFabMultiplayer.so is required
+    /// for 1.26.5x — the game's bundled one crashes in its static constructors on the macOS
+    /// shim. Backs up the original next to the destination, mirroring the official mod.
+    @discardableResult
+    public static func applyUniversalGameLibraries(modDirectory: URL, gameDirectory: URL) -> [String] {
+        let fm = FileManager.default
+        let patchRoot = modDirectory.appendingPathComponent("patches", isDirectory: true)
+        let destLib = gameDirectory.appendingPathComponent("lib/\(abi)", isDirectory: true)
+        guard let entries = try? fm.contentsOfDirectory(at: patchRoot, includingPropertiesForKeys: nil) else {
+            return []
+        }
+        var applied: [String] = []
+        for src in entries where src.pathExtension == "so" {
+            let dest = destLib.appendingPathComponent(src.lastPathComponent)
+            guard fm.fileExists(atPath: dest.path) else { continue }
+            do {
+                if let srcData = try? Data(contentsOf: src),
+                   let destData = try? Data(contentsOf: dest),
+                   srcData == destData {
+                    continue
+                }
+                let bak = dest.deletingPathExtension().appendingPathExtension("so.bck")
+                if !fm.fileExists(atPath: bak.path) {
+                    try fm.copyItem(at: dest, to: bak)
+                }
+                try fm.removeItem(at: dest)
+                try fm.copyItem(at: src, to: dest)
+                applied.append(src.lastPathComponent)
+            } catch {
+                // Best-effort; a missing replacement fails at game load with a clear error.
+            }
+        }
+        return applied
+    }
+
+    /// Installs the bundled freestanding symbol shim (ldiv, lldiv, div, fortify family) as a
+    /// guest mod under Patches/<gameVersion>/arm64-v8a, which Harbor passes via `-m`.
+    /// The shim injects its implementations into the guest libc.so at mod_preinit using
+    /// mcpelauncher_relocate — the same mechanism the official mcpelauncher-updates mod uses.
+    @discardableResult
+    public static func ensureSymbolShimInstalled(gameVersionName: String) throws -> URL? {
+        let fm = FileManager.default
+        let destDir = LocalRuntimeDiscovery.harborSupport
+            .appendingPathComponent("Patches/\(gameVersionName)/arm64-v8a", isDirectory: true)
+        let dest = destDir.appendingPathComponent("libharbor_symbol_shim.so", isDirectory: false)
+        if let size = try? fm.attributesOfItem(atPath: dest.path)[.size] as? Int, size > 0 {
+            return dest
+        }
+        guard let bundled = Bundle.module.url(forResource: "libharbor_symbol_shim", withExtension: "so") else {
+            return nil
+        }
+        try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+        if fm.fileExists(atPath: dest.path) {
+            try fm.removeItem(at: dest)
+        }
+        try fm.copyItem(at: bundled, to: dest)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dest.path)
+        return dest
     }
 
     // MARK: - Resolution
@@ -384,38 +453,46 @@ public struct HarborCompatibilityPatches: Sendable {
 
     // MARK: - Launch preparation
 
-    /// Prepare the compatibility mod for launch: install/upgrade it, verify it covers the game
-    /// version (blocking with an actionable error when it positively does not), and undo any
-    /// earlier in-place game library patching. Returns the mod directory to pass via `-m`.
+    /// Prepare compatibility for launch. Returns the official mod directory to pass via `-m`,
+    /// or nil when the official mod is known-broken for this game version — in that case
+    /// Harbor applies its own compat stack (guest libc hash repair, symbol shim mod,
+    /// universal game libraries) and the game must run without the official mod.
+    /// Throws `.compatibilityBlocked` when no known-good path exists for the game version.
     public static func prepareForLaunch(
         gameDirectory: URL,
         versionName: String? = nil,
-        versionCode: Int64? = nil
-    ) async throws -> URL {
+        versionCode: Int64? = nil,
+        runtimeRoot: URL? = nil
+    ) async throws -> URL? {
         let modDir = try await ensureInstalled(gameVersionName: versionName)
-        if let versionName, let meta = loadMetadata() {
-            if !meta.supportedVersionNames.isEmpty,
-               !metadataSupports(meta, versionCode: versionCode, versionName: versionName) {
-                let maxKnown = maxSupportedVersionName(in: meta.supportedVersionNames) ?? "?"
-                throw HarborError.compatibilityBlocked(
-                    reason: """
-                    Minecraft \(versionName) is newer than the mcpelauncher-updates patch on this Mac \
-                    (covers up to \(maxKnown)), so the launcher runtime would crash during startup. \
-                    Import an owned package of a supported version, or reconnect to the internet and \
-                    retry so Harbor can fetch a newer patch.
-                    """
-                )
+        guard let versionName, let meta = loadMetadata() else {
+            restorePatchedGameLibraries(gameDirectory: gameDirectory)
+            return modDir
+        }
+
+        if let rule = knownIncompatibility(gameVersionName: versionName, modVersion: meta.version) {
+            // Official mod crashes for this game generation (see rule.reason): bypass it and
+            // apply Harbor's stack. Verified with Minecraft 1.26.51.1 on runtime v1.8.4-573.
+            if let runtimeRoot {
+                _ = GuestLibcCompatibilityPatch.patch(runtimeRoot: runtimeRoot)
             }
-            if let rule = knownIncompatibility(gameVersionName: versionName, modVersion: meta.version) {
-                throw HarborError.compatibilityBlocked(
-                    reason: """
-                    Minecraft \(versionName) \(rule.reason). This Mac cannot run \(versionName) yet — \
-                    import an owned package of an older supported version (up to \
-                    \(maxSupportedVersionName(in: meta.supportedVersionNames) ?? "?")), or wait for the \
-                    next mcpelauncher-updates release; Harbor picks it up automatically once published.
-                    """
-                )
-            }
+            _ = try? ensureSymbolShimInstalled(gameVersionName: versionName)
+            restorePatchedGameLibraries(gameDirectory: gameDirectory)
+            applyUniversalGameLibraries(modDirectory: modDir, gameDirectory: gameDirectory)
+            return nil
+        }
+
+        if !meta.supportedVersionNames.isEmpty,
+           !metadataSupports(meta, versionCode: versionCode, versionName: versionName) {
+            let maxKnown = maxSupportedVersionName(in: meta.supportedVersionNames) ?? "?"
+            throw HarborError.compatibilityBlocked(
+                reason: """
+                Minecraft \(versionName) is newer than the mcpelauncher-updates patch on this Mac \
+                (covers up to \(maxKnown)), so the launcher runtime would crash during startup. \
+                Import an owned package of a supported version, or reconnect to the internet and \
+                retry so Harbor can fetch a newer patch.
+                """
+            )
         }
         restorePatchedGameLibraries(gameDirectory: gameDirectory)
         return modDir

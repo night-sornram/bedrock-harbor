@@ -308,18 +308,20 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         environment["BH_SESSION_RUNTIME"] = runtime.releaseID
 
         // Official mcpelauncher-updates compatibility mod (same public moddb as other launchers).
-        // The mod patches at runtime; game libraries are never copied into the package.
+        // For game generations where that mod is verified broken, prepareForLaunch applies
+        // Harbor's compat stack instead and returns nil (no mod directory on `-m`).
         var compatibilityPatchURL: URL?
         let gameURL = URL(fileURLWithPath: installation.relativeGameDirectory, isDirectory: true)
         do {
             compatibilityPatchURL = try await HarborCompatibilityPatches.prepareForLaunch(
                 gameDirectory: gameURL,
                 versionName: installation.originalVersionName,
-                versionCode: installation.buildID.versionCode
+                versionCode: installation.buildID.versionCode,
+                runtimeRoot: layout.runtimeRootURL
             )
         } catch let error as HarborError {
-            // A game version positively known to be unsupported must not launch (guaranteed
-            // startup crash); patch-fetch failures degrade to launching without the mod.
+            // A game version positively known to be unrunnable must not launch; patch-fetch
+            // failures degrade to launching without the mod.
             if case .compatibilityBlocked = error { throw error }
             compatibilityPatchURL = nil
         } catch {

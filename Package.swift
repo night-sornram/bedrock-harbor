@@ -48,7 +48,12 @@ let package = Package(
         .target(
             name: "HarborRuntime",
             dependencies: ["HarborDomain", "HarborPlatform"],
-            path: "Sources/HarborRuntime"
+            path: "Sources/HarborRuntime",
+            resources: [
+                // Prebuilt guest mod (freestanding aarch64 ELF; source + build recipe in
+                // Scripts/HarborSymbolShim). Provides bionic symbols the macOS libc shim lacks.
+                .copy("Resources/libharbor_symbol_shim.so"),
+            ]
         ),
         .target(
             name: "HarborFeatures",
