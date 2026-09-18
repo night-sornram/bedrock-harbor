@@ -3,6 +3,7 @@ import Foundation
 import HarborApplication
 import HarborDomain
 import HarborGooglePlay
+import HarborRuntime
 import SwiftUI
 
 // MARK: - Shared
@@ -131,10 +132,9 @@ public final class AppState {
     }
 
     public var nextStep: Int {
-        if !hasVerifiedGame && (isPlaySignedIn || usedLocalAPK) { return 2 }
-        if !isPlaySignedIn && !usedLocalAPK { return 1 }
-        if !hasVerifiedGame { return 2 }
-        return 3
+        if hasVerifiedGame { return 3 }
+        if isPlaySignedIn || usedLocalAPK { return 2 }
+        return 1
     }
 
     public var usedLocalAPK: Bool {
@@ -143,7 +143,9 @@ public final class AppState {
     }
 
     public func refreshGate() {
-        if isPlaySignedIn || usedLocalAPK {
+        // A verified local game package is enough to play — Google Play sign-in is only
+        // needed for store features, never for launching an installed package.
+        if isPlaySignedIn || usedLocalAPK || hasVerifiedGame {
             needsOnboarding = false
         } else {
             needsOnboarding = true
@@ -178,27 +180,8 @@ public final class AppState {
     public func useLocalAPK() {
         usedLocalAPK = true
         needsOnboarding = false
-        status = "Local package mode — Import APK or Rescan after Minecraft Bedrock Launcher downloads"
+        status = "Local package mode — Install from APK / folder… or Rescan packages"
         refreshGate()
-    }
-
-    public func openPackageSourceLauncher() {
-        let candidates = [
-            "/Applications/Minecraft Bedrock Launcher.app",
-            homeMinecraftBedrockLauncherPath(),
-        ]
-        for path in candidates where FileManager.default.fileExists(atPath: path) {
-            NSWorkspace.shared.open(URL(fileURLWithPath: path))
-            status = "Minecraft Bedrock Launcher opened. Sign in with Google Play there, download Minecraft, then press Rescan packages in Harbor."
-            return
-        }
-        status = "Minecraft Bedrock Launcher not installed. Use Install from APK / folder… with an owned package."
-    }
-
-    private func homeMinecraftBedrockLauncherPath() -> String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BedrockHarbor/Runtimes/_downloads")
-            .path
     }
 
     public func rescanPackages() async {
@@ -210,7 +193,7 @@ public final class AppState {
         if let install = result.installation {
             status = "Package ready: \(install.originalVersionName) — Launch"
         } else {
-            status = "No Minecraft package found. Use Minecraft Bedrock Launcher to download once, or Install from APK / folder…"
+            status = "No Minecraft package found. Use Install Minecraft (downloads from Google Play), or Install from APK / folder…"
         }
     }
 
@@ -222,6 +205,37 @@ public final class AppState {
     }
 
     // MARK: Actions
+
+    /// The Minecraft Bedrock Launcher runtime ships mcpelauncher-extract + mcpelauncher-client.
+    /// When it is missing (fresh Mac, wiped data) Harbor installs it automatically —
+    /// no manual script step.
+    public func ensureLauncherRuntimeInstalled() async -> Bool {
+        if HarborRuntimeInstaller.runtimePresent() { return true }
+        status = "Installing Minecraft Bedrock Launcher…"
+        do {
+            _ = try await HarborRuntimeInstaller.ensureInstalled(status: { text in
+                Task { @MainActor in self.status = text }
+            })
+        } catch {
+            status = "Minecraft Bedrock Launcher install failed: \(error.localizedDescription)"
+            return false
+        }
+        // Persist the freshly installed runtime so Launch works in this same session.
+        guard let bundle = LocalRuntimeDiscovery().discoverDefault() else {
+            status = "Minecraft Bedrock Launcher installed but not detected — restart Harbor"
+            return false
+        }
+        var runtimes = (try? await services.metadata.loadRuntimeInstallations()) ?? []
+        if let i = runtimes.firstIndex(where: { $0.releaseID == bundle.runtimeInstallation.releaseID }) {
+            runtimes[i] = bundle.runtimeInstallation
+        } else {
+            runtimes.append(bundle.runtimeInstallation)
+        }
+        try? await services.metadata.saveRuntimeInstallations(runtimes)
+        await reload()
+        status = "Minecraft Bedrock Launcher installed — continuing…"
+        return true
+    }
 
     /// Wait for sign-in sheet exactly once (observer + timeout must not both resume).
     private final class ResumeOnce: @unchecked Sendable {
@@ -314,6 +328,9 @@ public final class AppState {
             status = "Minecraft \(existing.originalVersionName) ready — Launch"
             return
         }
+
+        // APK extraction needs mcpelauncher-extract — install the launcher runtime first.
+        guard await ensureLauncherRuntimeInstalled() else { return }
 
         status = "Checking Google Play session…"
         var auth = await PlaySessionStore.harvestFromWebKit(email: playAccountLabel.isEmpty ? nil : playAccountLabel)
@@ -470,13 +487,14 @@ public final class AppState {
         await reload()
     }
 
-    /// Clear UX when Google will not hand APKs to Harbor. Package source is the working path.
+    /// Clear UX when Google will not hand APKs to Harbor.
     private static func packageNeededMessage(details: String) -> String {
         """
-        Harbor cannot download Minecraft APK from Google Play right now (unofficial client blocked).\n\n\
-        Working ways to get the owned package:\n\
-        1) Open Minecraft Bedrock Launcher → Google Play login → download Minecraft → Harbor Rescan packages\n\
-        2) Home → Install from APK / folder… (owned base.apk or game folder with lib/arm64-v8a/libminecraftpe.so)\n\n\
+        Harbor could not download Minecraft from Google Play this time.\n\n\
+        Things to check:\n\
+        1) The signed-in Google account owns Minecraft on Play\n\
+        2) Run setup again, then Install — a fresh Play token often fixes it\n\
+        3) Home → Install from APK / folder… (owned base.apk or game folder with lib/arm64-v8a/libminecraftpe.so)\n\n\
         Play login can still be real. This is Google delivery policy, not a Harbor account bug.\n\n\
         Detail: \(details)
         """
@@ -514,6 +532,7 @@ public final class AppState {
             do {
                 let install: InstalledMinecraft
                 if url.pathExtension.lowercased() == "apk" {
+                    guard await self.ensureLauncherRuntimeInstalled() else { return }
                     install = try await GamePackageAcquirer.extractAPK(url, services: services)
                 } else {
                     install = try await GamePackageAcquirer.importIntoHarbor(from: url, services: services)
@@ -537,6 +556,10 @@ public final class AppState {
                 status = "Cannot launch — Minecraft package missing"
                 return
             }
+        }
+        if runtime == nil {
+            // Last-resort self-heal (startup install may have failed while offline).
+            guard await ensureLauncherRuntimeInstalled() else { return }
         }
         guard let profile = selectedProfile,
               let installation = gameInstallation,
@@ -658,13 +681,6 @@ public struct OnboardingView: View {
                     .font(.headline)
             }
 
-            Button {
-                app.openPackageSourceLauncher()
-            } label: {
-                Label("Open Minecraft Bedrock Launcher to download package", systemImage: "shippingbox")
-            }
-            .buttonStyle(.bordered)
-
             Button("I have an APK — skip Play download") {
                 app.useLocalAPK()
             }
@@ -734,14 +750,6 @@ public struct HomeView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(app.isInstalling)
 
-                            Button {
-                                app.openPackageSourceLauncher()
-                            } label: {
-                                Label("Open Minecraft Bedrock Launcher (Play download source)", systemImage: "shippingbox")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
-
                             HStack(spacing: 12) {
                                 Button("Rescan packages") {
                                     Task { await app.rescanPackages() }
@@ -795,8 +803,6 @@ public struct HomeView: View {
                 HStack(spacing: 16) {
                     Button("Open Minecraft on Play Store") { app.openPlayStoreListing() }
                         .buttonStyle(.link)
-                    Button("Package source launcher…") { app.openPackageSourceLauncher() }
-                        .buttonStyle(.link)
                     Button("Install from APK / folder…") { app.importAPK() }
                         .buttonStyle(.link)
                     Button("Rescan packages") { Task { await app.rescanPackages() } }
@@ -826,9 +832,6 @@ public struct SettingsView: View {
                 LabeledContent("Google Play", value: app.isPlaySignedIn ? app.playAccountLabel : "Not signed in")
                 Button("Sign in again") {
                     Task { await app.googleSignIn(fresh: true) }
-                }
-                Button("Open package source launcher") {
-                    app.openPackageSourceLauncher()
                 }
                 Button("Rescan packages") {
                     Task { await app.rescanPackages() }
@@ -869,7 +872,7 @@ public struct SettingsView: View {
         Compatibility mod: minecraft-linux/mcpelauncher-updates via mcpelauncher-moddb
         Symbol shim & libc repair: BedrockHarbor, Apache-2.0
         Google Play client: BedrockHarbor independent client
-        Game packages: user-owned imports; downloads via the official Minecraft Bedrock Launcher
+        Game packages: user-owned; downloaded from Google Play by Harbor's Play client
 
         BedrockHarbor is not affiliated with Mojang, Microsoft, Google, or the minecraft-linux maintainers.
         """

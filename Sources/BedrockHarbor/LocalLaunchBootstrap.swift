@@ -22,10 +22,19 @@ public enum LocalLaunchBootstrap {
         launcher: ProcessLaunchSupervisor
     ) async throws -> String {
         try services.paths.ensurePrivateDirectoryLayout()
-        guard let bundle = LocalRuntimeDiscovery().discoverDefault() else {
-            throw HarborError.unsupportedRuntime(
-                reason: "No runtime in BedrockHarbor/Runtimes. Run Scripts/install_local_runtime.sh first."
-            )
+        // Self-heal a missing launcher runtime (e.g. after a data wipe) instead of
+        // requiring Scripts/install_local_runtime.sh to be run by hand.
+        let bundle: LocalRuntimeDiscovery.DiscoveredBundle
+        if let existing = LocalRuntimeDiscovery().discoverDefault() {
+            bundle = existing
+        } else {
+            _ = try await HarborRuntimeInstaller.ensureInstalled()
+            guard let installed = LocalRuntimeDiscovery().discoverDefault() else {
+                throw HarborError.unsupportedRuntime(
+                    reason: "Minecraft Bedrock Launcher could not be installed automatically — check the network and reopen Harbor"
+                )
+            }
+            bundle = installed
         }
         await launcher.registerLayout(bundle.layout)
 

@@ -35,6 +35,8 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/BedrockHarbor"
 chmod 755 "$APP/Contents/MacOS/BedrockHarbor"
+# SwiftPM resource bundles — Bundle.module lookups crash the packaged app without them
+find "$ROOT/.build/out/Products/Debug" -maxdepth 1 -name "*_*.bundle" -exec cp -R {} "$APP/Contents/Resources/" \;
 cp "$LOGO" "$APP/Contents/Resources/BedrockHarbor.png"
 cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
 

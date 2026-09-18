@@ -331,14 +331,22 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
             environment["BH_COMPAT_PATCH"] = patch.path
         }
 
+        // prepareForLaunch may have JUST installed the symbol shim into Patches/<version>/,
+        // after the layout captured modsDirectories at discovery time — re-resolve from disk
+        // so the first launch after a wipe also passes the shim via -m.
+        var effectiveLayout = layout
+        effectiveLayout.modsDirectories = LocalRuntimeDiscovery.harborModsPaths(
+            gameVersionName: installation.originalVersionName
+        )
+
         return LaunchPlan(
-            executableURL: layout.executableURL,
-            arguments: layout.arguments(
+            executableURL: effectiveLayout.executableURL,
+            arguments: effectiveLayout.arguments(
                 dataDirectory: root,
                 cacheDirectory: cache,
                 compatibilityPatchPath: compatibilityPatchURL
             ),
-            workingDirectoryURL: layout.preferredWorkingDirectory,
+            workingDirectoryURL: effectiveLayout.preferredWorkingDirectory,
             environment: environment,
             gameDataDirectoryURL: root,
             cacheDirectoryURL: cache,

@@ -230,6 +230,49 @@ public struct HarborCompatibilityPatches: Sendable {
         return applied
     }
 
+    /// Version-pinned rebuilds from the official patch bundle (`patches/v*/arm64-v8a/`):
+    /// upstream ships macOS-compatible rebuilds of game libraries whose shipped builds
+    /// crash on the mcpelauncher runtime — Minecraft 1.26.5x's own libmaesdk.so dies in
+    /// its static constructor (verified 2026-09-18: the game only runs with the
+    /// v1.26.0.2 rebuild; SIGSEGV jumps into mangled-name strings otherwise).
+    /// Applied only on the official-mod bypass path, with .bck backup like the universal
+    /// swap; only replaces libraries the game already ships.
+    @discardableResult
+    public static func applyVersionPinnedRebuilds(modDirectory: URL, gameDirectory: URL) -> [String] {
+        let fm = FileManager.default
+        let patchRoot = modDirectory.appendingPathComponent("patches", isDirectory: true)
+        let destLib = gameDirectory.appendingPathComponent("lib/\(abi)", isDirectory: true)
+        guard let versions = try? fm.contentsOfDirectory(at: patchRoot, includingPropertiesForKeys: nil) else {
+            return []
+        }
+        var applied: [String] = []
+        for vdir in versions where vdir.lastPathComponent.hasPrefix("v") {
+            let libDir = vdir.appendingPathComponent(abi, isDirectory: true)
+            guard let entries = try? fm.contentsOfDirectory(at: libDir, includingPropertiesForKeys: nil) else { continue }
+            for src in entries where src.pathExtension == "so" {
+                let dest = destLib.appendingPathComponent(src.lastPathComponent)
+                guard fm.fileExists(atPath: dest.path) else { continue }
+                if let srcData = try? Data(contentsOf: src),
+                   let destData = try? Data(contentsOf: dest),
+                   srcData == destData {
+                    continue
+                }
+                do {
+                    let bak = dest.deletingPathExtension().appendingPathExtension("so.bck")
+                    if !fm.fileExists(atPath: bak.path) {
+                        try fm.copyItem(at: dest, to: bak)
+                    }
+                    try fm.removeItem(at: dest)
+                    try fm.copyItem(at: src, to: dest)
+                    applied.append("\(vdir.lastPathComponent)/\(src.lastPathComponent)")
+                } catch {
+                    // Best-effort; a missing replacement fails at game load with a clear error.
+                }
+            }
+        }
+        return applied
+    }
+
     /// Installs the bundled freestanding symbol shim (ldiv, lldiv, div, fortify family) as a
     /// guest mod under Patches/<gameVersion>/arm64-v8a, which Harbor passes via `-m`.
     /// The shim injects its implementations into the guest libc.so at mod_preinit using
@@ -479,6 +522,7 @@ public struct HarborCompatibilityPatches: Sendable {
             _ = try? ensureSymbolShimInstalled(gameVersionName: versionName)
             restorePatchedGameLibraries(gameDirectory: gameDirectory)
             applyUniversalGameLibraries(modDirectory: modDir, gameDirectory: gameDirectory)
+            applyVersionPinnedRebuilds(modDirectory: modDir, gameDirectory: gameDirectory)
             return nil
         }
 
