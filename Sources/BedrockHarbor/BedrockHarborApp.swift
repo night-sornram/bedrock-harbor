@@ -33,6 +33,11 @@ final class AppBootstrap {
                 } catch {
                     bootstrapNote = error.localizedDescription
                 }
+                // The UI's first metadata read races this bootstrap (it can download
+                // the runtime for ~40 s) — tell it to re-read state now that the
+                // writes are done, or the Home screen can sit on the Install step
+                // for an already-installed game.
+                NotificationCenter.default.post(name: .harborBootstrapFinished, object: nil)
             }
             startupError = nil
         } catch {

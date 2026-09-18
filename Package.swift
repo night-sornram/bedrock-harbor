@@ -98,6 +98,18 @@ let package = Package(
             dependencies: ["HarborPlatform", "HarborDomain"],
             path: "Tests/HarborPlatformTests"
         ),
+        .testTarget(
+            name: "HarborFeaturesTests",
+            dependencies: [
+                "HarborFeatures",
+                "HarborApplication",
+                "HarborCompatibility",
+                "HarborDomain",
+                "HarborPlatform",
+                "HarborRuntime",
+            ],
+            path: "Tests/HarborFeaturesTests"
+        ),
     ],
     swiftLanguageModes: [.v6]
 )

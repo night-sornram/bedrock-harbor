@@ -82,6 +82,14 @@ public struct StepRow: View {
 
 // MARK: - State
 
+/// Posted once the startup bootstrap (runtime self-heal, metadata repair, package
+/// acquisition) has finished — it can run for ~40 s after a data wipe, well past
+/// the UI's first metadata read. AppState reloads on it so the Home screen cannot
+/// stay stuck on the "Install" step for an already-installed game.
+extension Notification.Name {
+    public static let harborBootstrapFinished = Notification.Name("com.bedrockharbor.bootstrap.finished")
+}
+
 @MainActor
 @Observable
 public final class AppState {
@@ -100,6 +108,7 @@ public final class AppState {
 
     public let services: HarborServiceBundle
     private var sessionCoordinator: GameSessionCoordinator?
+    private let bootstrapBox = ObserverBox()
 
     private static let localAPKKey = "com.bedrockharbor.localapk.mode"
     private static let onboardKey = "com.bedrockharbor.onboarding.completed"
@@ -108,6 +117,18 @@ public final class AppState {
         self.services = services
         self.sessionCoordinator = GameSessionCoordinator(services: services)
         self.needsOnboarding = !UserDefaults.standard.bool(forKey: Self.localAPKKey)
+        bootstrapBox.token = NotificationCenter.default.addObserver(
+            forName: .harborBootstrapFinished,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in await self.reload() }
+        }
+    }
+
+    deinit {
+        if let token = bootstrapBox.token { NotificationCenter.default.removeObserver(token) }
     }
 
     public var selectedProfile: Profile? {
@@ -123,7 +144,16 @@ public final class AppState {
 
     public var runtime: RuntimeInstallation? { runtimes.first }
 
-    public var hasVerifiedGame: Bool { gameInstallation?.integrity == .verified }
+    /// Disk-verified on purpose: the first metadata read races the startup bootstrap
+    /// (and a lost concurrent write can drop the record), and trusting metadata alone
+    /// randomly leaves the UI on the "Install Minecraft" step for an installed game.
+    public var hasVerifiedGame: Bool {
+        guard let install = gameInstallation, install.integrity == .verified else { return false }
+        let receipt = install.packageReceipts.first
+            ?? URL(fileURLWithPath: install.relativeGameDirectory, isDirectory: true)
+                .appendingPathComponent("lib/arm64-v8a/libminecraftpe.so").path
+        return FileManager.default.fileExists(atPath: receipt)
+    }
 
     public var isPlaySignedIn: Bool {
         if HarborPlayTokenBridge.loadOAuthToken() != nil { return true }
@@ -210,7 +240,20 @@ public final class AppState {
     /// When it is missing (fresh Mac, wiped data) Harbor installs it automatically —
     /// no manual script step.
     public func ensureLauncherRuntimeInstalled() async -> Bool {
-        if HarborRuntimeInstaller.runtimePresent() { return true }
+        if HarborRuntimeInstaller.runtimePresent() {
+            // Runtime is on disk — but if metadata lost the record (startup race,
+            // wiped metadata), repair it so Launch and the step list don't act as
+            // if an install is still pending.
+            if runtime == nil, let bundle = LocalRuntimeDiscovery().discoverDefault() {
+                var runtimes = (try? await services.metadata.loadRuntimeInstallations()) ?? []
+                if !runtimes.contains(where: { $0.releaseID == bundle.runtimeInstallation.releaseID }) {
+                    runtimes.append(bundle.runtimeInstallation)
+                    try? await services.metadata.saveRuntimeInstallations(runtimes)
+                }
+                await reload()
+            }
+            return true
+        }
         status = "Installing Minecraft Bedrock Launcher…"
         do {
             _ = try await HarborRuntimeInstaller.ensureInstalled(status: { text in

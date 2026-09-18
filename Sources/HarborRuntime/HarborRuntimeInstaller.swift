@@ -102,12 +102,27 @@ public enum HarborRuntimeInstaller {
     /// Mount the DMG read-only and deploy the launcher app it contains.
     public static func deploy(from dmg: URL) throws {
         let fm = FileManager.default
-        let mountPoint = dmg.deletingLastPathComponent().appendingPathComponent("mnt", isDirectory: true)
+        // Unique mount dir per deploy + guaranteed detach: a leaked mount at a fixed
+        // path both breaks the next attach ("mountpoint busy") and lingers as a
+        // visible "Minecraft Bedrock Launcher" volume on the user's Mac.
+        let mountPoint = dmg.deletingLastPathComponent()
+            .appendingPathComponent("mnt-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: mountPoint, withIntermediateDirectories: true)
-        try runTool("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly", "-mountpoint", mountPoint.path])
-        var mounted = true
+        var mounted = false
         defer {
-            if mounted { try? runTool("/usr/bin/hdiutil", ["detach", mountPoint.path]) }
+            if mounted {
+                try? runTool("/usr/bin/hdiutil", ["detach", mountPoint.path])
+                try? runTool("/usr/bin/hdiutil", ["detach", "-force", mountPoint.path])
+            }
+            try? fm.removeItem(at: mountPoint)
+        }
+        do {
+            try runTool("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly", "-mountpoint", mountPoint.path])
+            mounted = true
+        } catch {
+            try? runTool("/usr/bin/hdiutil", ["detach", mountPoint.path])
+            try? fm.removeItem(at: mountPoint)
+            throw error
         }
         let contents = mountPoint.appendingPathComponent("Minecraft Bedrock Launcher.app/Contents", isDirectory: true)
         guard fm.fileExists(atPath: contents.path) else {
@@ -116,8 +131,6 @@ public enum HarborRuntimeInstaller {
         let destination = LocalRuntimeDiscovery.harborSupport
             .appendingPathComponent("Runtimes/\(installDirectoryName)", isDirectory: true)
         try deploy(appContents: contents, destination: destination)
-        mounted = false
-        try runTool("/usr/bin/hdiutil", ["detach", mountPoint.path])
     }
 
     /// Pure file layout step: copy app bundle contents into a runtime root and

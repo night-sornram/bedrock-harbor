@@ -6,7 +6,6 @@ set -euo pipefail
 SUPPORT="$HOME/Library/Application Support/BedrockHarbor"
 DL="$SUPPORT/Runtimes/_downloads"
 DMG="$DL/Minecraft.Bedrock.Launcher.dmg"
-MNT="$DL/mnt"
 DEST="$SUPPORT/Runtimes/harbor-mcpelauncher-v1.8.4-573"
 URL="https://github.com/minecraft-linux/macos-builder/releases/download/v1.8.4-573/Minecraft.Bedrock.Launcher.dmg"
 
@@ -14,10 +13,16 @@ mkdir -p "$DL"
 if [ ! -f "$DMG" ]; then
   curl -L --fail --retry 3 -o "$DMG" "$URL"
 fi
+# Unique mount dir + guaranteed detach: a leaked fixed-path mount breaks the next
+# attach and lingers as a visible "Minecraft Bedrock Launcher" volume.
+MNT="$DL/mnt-$$"
+cleanup() {
+  hdiutil detach "$MNT" >/dev/null 2>&1 || hdiutil detach -force "$MNT" >/dev/null 2>&1 || true
+  rmdir "$MNT" 2>/dev/null || true
+}
+trap cleanup EXIT
 mkdir -p "$MNT"
-if [ ! -d "$MNT/Minecraft Bedrock Launcher.app" ]; then
-  hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" >/dev/null
-fi
+hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" >/dev/null
 
 APP="$MNT/Minecraft Bedrock Launcher.app/Contents"
 rm -rf "$DEST"
@@ -44,4 +49,3 @@ cat > "$DEST/runtime.json" <<EOF
 EOF
 echo "Runtime: $DEST"
 shasum -a 256 "$DEST/MacOS/mcpelauncher-client"
-hdiutil detach "$MNT" 2>/dev/null || true
