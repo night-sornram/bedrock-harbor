@@ -26,6 +26,14 @@ final class HarborRuntimeInstallerTests: XCTestCase {
         let client = contents.appendingPathComponent("MacOS/mcpelauncher-client")
         try "#!/bin/sh\nexit 0\n".write(to: client, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: client.path)
+        // The bundle's Qt plugins — mcpelauncher-webview (Microsoft sign-in) aborts
+        // without the cocoa platform plugin.
+        try fm.createDirectory(at: contents.appendingPathComponent("PlugIns/platforms"), withIntermediateDirectories: true)
+        try "fake cocoa plugin".write(
+            to: contents.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib"),
+            atomically: true,
+            encoding: .utf8
+        )
         try "controller db".write(
             to: contents.appendingPathComponent("Resources/mcpelauncher/gamecontrollerdb.txt"),
             atomically: true,
@@ -68,6 +76,52 @@ final class HarborRuntimeInstallerTests: XCTestCase {
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: dest.appendingPathComponent("MacOS/stale-dir").path))
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: dest.appendingPathComponent("MacOS/mcpelauncher-client").path))
+    }
+
+    func testDeployCopiesQtPlugInsSoSignInWebviewCanStart() throws {
+        let contents = try makeFakeAppContents()
+        let dest = tempDir.appendingPathComponent("harbor-mcpelauncher-test", isDirectory: true)
+
+        try HarborRuntimeInstaller.deploy(appContents: contents, destination: dest)
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: dest.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib").path
+            ),
+            "deploy must copy the app bundle's PlugIns — without libqcocoa.dylib the Xbox sign-in webview crashes"
+        )
+    }
+
+    func testDeployRejectsBundleWithoutPlugIns() throws {
+        let contents = try makeFakeAppContents()
+        try FileManager.default.removeItem(at: contents.appendingPathComponent("PlugIns"))
+
+        XCTAssertThrowsError(
+            try HarborRuntimeInstaller.deploy(
+                appContents: contents,
+                destination: tempDir.appendingPathComponent("dest", isDirectory: true)
+            )
+        )
+    }
+
+    func testRuntimeRootUsableRequiresLoginWebviewPlugin() throws {
+        let fm = FileManager.default
+        let root = tempDir.appendingPathComponent("runtime-root", isDirectory: true)
+        try fm.createDirectory(at: root.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
+        let client = root.appendingPathComponent("MacOS/mcpelauncher-client")
+        try "#!/bin/sh\nexit 0\n".write(to: client, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: client.path)
+
+        // Client alone is not enough — the sign-in webview needs its platform plugin.
+        XCTAssertFalse(LocalRuntimeDiscovery.isRuntimeRootUsable(root))
+
+        try fm.createDirectory(at: root.appendingPathComponent("PlugIns/platforms"), withIntermediateDirectories: true)
+        try "plugin".write(
+            to: root.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertTrue(LocalRuntimeDiscovery.isRuntimeRootUsable(root))
     }
 
     func testDeployRejectsNonAppBundle() throws {

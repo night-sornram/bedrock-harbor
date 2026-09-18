@@ -21,10 +21,12 @@ fi
 
 APP="$MNT/Minecraft Bedrock Launcher.app/Contents"
 rm -rf "$DEST"
-mkdir -p "$DEST/MacOS" "$DEST/Resources" "$DEST/Frameworks" "$DEST/share"
+mkdir -p "$DEST/MacOS" "$DEST/Resources" "$DEST/Frameworks" "$DEST/PlugIns" "$DEST/share"
 cp -a "$APP/MacOS/." "$DEST/MacOS/"
 cp -a "$APP/Resources/." "$DEST/Resources/"
 cp -a "$APP/Frameworks/." "$DEST/Frameworks/"
+# Qt plugins are required by mcpelauncher-webview (Microsoft sign-in) — see Resources/qt.conf.
+cp -a "$APP/PlugIns/." "$DEST/PlugIns/"
 cp -a "$DEST/Resources/mcpelauncher" "$DEST/share/mcpelauncher"
 cat > "$DEST/runtime.json" <<EOF
 {

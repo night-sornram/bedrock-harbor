@@ -127,12 +127,17 @@ public enum HarborRuntimeInstaller {
         guard fm.fileExists(atPath: appContents.appendingPathComponent("MacOS").path) else {
             throw HarborError.invalidPackage(reason: "Not a macOS app bundle: \(appContents.path)")
         }
+        // Without the Qt platform plugins the Xbox sign-in webview crashes at
+        // startup (in-game: login error Llama 0x80070057) — refuse plugin-less bundles.
+        guard fm.fileExists(atPath: appContents.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib").path) else {
+            throw HarborError.invalidPackage(reason: "Launcher bundle is missing Qt platform plugins: \(appContents.path)")
+        }
         if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
         try fm.createDirectory(
             at: destination.appendingPathComponent("share", isDirectory: true),
             withIntermediateDirectories: true
         )
-        for dir in ["MacOS", "Resources", "Frameworks"] {
+        for dir in ["MacOS", "Resources", "Frameworks", "PlugIns"] {
             try fm.copyItem(
                 at: appContents.appendingPathComponent(dir, isDirectory: true),
                 to: destination.appendingPathComponent(dir, isDirectory: true)
