@@ -17,10 +17,8 @@ let package = Package(
         .executable(name: "BedrockHarbor", targets: ["BedrockHarbor"]),
     ],
     dependencies: [
-        // Intentionally empty at foundation stage.
-        // ZIPFoundation 0.9.20 / SwiftProtobuf 1.38.1 / Sparkle 2.10.0 are added
-        // behind adapter boundaries once those targets need real I/O stacks.
-        // See docs/DEPENDENCY_POLICY.md.
+        // Path A: independent Harbor Play client — no FinskyKit.
+        // See docs/DEPENDENCY_POLICY.md and session notes.
     ],
     targets: [
         .target(
@@ -84,6 +82,11 @@ let package = Package(
             name: "HarborApplicationTests",
             dependencies: ["HarborApplication", "HarborDomain", "HarborCompatibility", "HarborPlatform"],
             path: "Tests/HarborApplicationTests"
+        ),
+        .testTarget(
+            name: "HarborRuntimeTests",
+            dependencies: ["HarborRuntime", "HarborDomain"],
+            path: "Tests/HarborRuntimeTests"
         ),
         .testTarget(
             name: "HarborPlatformTests",

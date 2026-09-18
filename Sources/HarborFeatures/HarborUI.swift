@@ -125,10 +125,13 @@ public final class AppState {
     public var hasVerifiedGame: Bool { gameInstallation?.integrity == .verified }
 
     public var isPlaySignedIn: Bool {
-        accounts.contains { $0.sessionState == .ready }
+        if HarborPlayTokenBridge.loadOAuthToken() != nil { return true }
+        if PlaySessionStore.load().cookies["oauth_token"] != nil { return true }
+        return accounts.contains { $0.sessionState == .ready && $0.accountLabel.contains("@") }
     }
 
     public var nextStep: Int {
+        if !hasVerifiedGame && (isPlaySignedIn || usedLocalAPK) { return 2 }
         if !isPlaySignedIn && !usedLocalAPK { return 1 }
         if !hasVerifiedGame { return 2 }
         return 3
@@ -175,7 +178,40 @@ public final class AppState {
     public func useLocalAPK() {
         usedLocalAPK = true
         needsOnboarding = false
-        status = "Local APK mode — choose an owned .apk if install finds nothing"
+        status = "Local package mode — Import APK or Rescan after Minecraft Bedrock Launcher downloads"
+        refreshGate()
+    }
+
+    public func openPackageSourceLauncher() {
+        let candidates = [
+            "/Applications/Minecraft Bedrock Launcher.app",
+            homeMinecraftBedrockLauncherPath(),
+        ]
+        for path in candidates where FileManager.default.fileExists(atPath: path) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+            status = "Minecraft Bedrock Launcher opened. Sign in with Google Play there, download Minecraft, then press Rescan packages in Harbor."
+            return
+        }
+        status = "Minecraft Bedrock Launcher not installed. Use Install from APK / folder… with an owned package."
+    }
+
+    private func homeMinecraftBedrockLauncherPath() -> String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BedrockHarbor/Runtimes/_downloads")
+            .path
+    }
+
+    public func rescanPackages() async {
+        isInstalling = true
+        defer { isInstalling = false }
+        status = "Scanning for Minecraft packages…"
+        let result = await GamePackageAcquirer.acquire(services: services)
+        await reload()
+        if let install = result.installation {
+            status = "Package ready: \(install.originalVersionName) — Launch"
+        } else {
+            status = "No Minecraft package found. Use Minecraft Bedrock Launcher to download once, or Install from APK / folder…"
+        }
     }
 
     public func resetSetup() {
@@ -187,36 +223,81 @@ public final class AppState {
 
     // MARK: Actions
 
-    public func googleSignIn() async {
+    /// Wait for sign-in sheet exactly once (observer + timeout must not both resume).
+    private final class ResumeOnce: @unchecked Sendable {
+        private var done = false
+        private let lock = NSLock()
+        func resume(_ cont: CheckedContinuation<Void, Never>) {
+            lock.lock()
+            let already = done
+            done = true
+            lock.unlock()
+            if !already { cont.resume() }
+        }
+    }
+
+    private final class ObserverBox: @unchecked Sendable {
+        var token: NSObjectProtocol?
+    }
+
+    public func googleSignIn(fresh: Bool = false) async {
         signInBusy = true
-        status = "Opening Google sign-in…"
-        GoogleSignInController.shared.present()
+        status = fresh ? "Opening Google sign-in (fresh Android setup)…" : "Opening Google sign-in…"
+        GoogleSignInController.shared.present(freshLogin: fresh)
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            var token: NSObjectProtocol?
-            token = NotificationCenter.default.addObserver(forName: .bhGoogleSignInFinished, object: nil, queue: .main) { _ in
-                if let token { NotificationCenter.default.removeObserver(token) }
-                cont.resume()
+            let once = ResumeOnce()
+            let observerBox = ObserverBox()
+            let center = NotificationCenter.default
+            observerBox.token = center.addObserver(forName: .bhGoogleSignInFinished, object: nil, queue: .main) { _ in
+                if let token = observerBox.token { center.removeObserver(token) }
+                once.resume(cont)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 180) {
-                if let token { NotificationCenter.default.removeObserver(token) }
-                cont.resume()
+                if let token = observerBox.token { center.removeObserver(token) }
+                once.resume(cont)
             }
         }
-        if let email = GoogleSignInController.shared.signedInEmail {
-            playAccountLabel = email
+
+        let session = PlaySessionStore.load()
+        let oauth = HarborPlayTokenBridge.loadOAuthToken() ?? session.cookies["oauth_token"]
+        var email = GoogleSignInController.shared.signedInEmail
+        if email == nil || !(email?.contains("@") ?? false) {
+            email = HarborPlayTokenBridge.loadAccountEmail()
+        }
+        if email == nil || !(email?.contains("@") ?? false) {
+            if session.accountEmail?.contains("@") == true { email = session.accountEmail }
+            else if let e = session.cookies["Email"], e.contains("@") { email = e }
+        }
+        let userID = session.cookies["user_id"]
+
+        if oauth != nil || (email?.contains("@") ?? false) {
+            if let email, email.contains("@") {
+                playAccountLabel = email
+                HarborPlayTokenBridge.saveAccountEmail(email)
+            } else if let userID {
+                playAccountLabel = "Play user \(userID.prefix(8))…"
+            } else {
+                playAccountLabel = "Google Play"
+            }
             let account = AccountRecord(
                 providerID: .googlePlay,
-                accountLabel: email,
+                accountLabel: playAccountLabel,
                 sessionState: .ready,
                 keychainReference: "play-\(UUID().uuidString)"
             )
             accounts.removeAll { $0.providerID == .googlePlay }
             accounts.append(account)
             try? await services.metadata.saveAccounts(accounts)
-            completeOnboardingFromLogin()
-            status = "Signed in as \(email) — next: Install Minecraft"
+            if oauth != nil {
+                completeOnboardingFromLogin()
+                status = "Play token ready (\(playAccountLabel)) — next: Install Minecraft"
+            } else {
+                status = "Signed in as \(playAccountLabel), but oauth_token missing — open Android setup once more"
+                needsOnboarding = true
+                refreshGate()
+            }
         } else {
-            status = "Google sign-in not finished — try again"
+            status = "Google sign-in not finished — complete Android setup until status shows oauth_token"
         }
         signInBusy = false
         await reload()
@@ -226,6 +307,7 @@ public final class AppState {
         isInstalling = true
         defer { isInstalling = false }
 
+        // Prefer any package already on disk before Play network paths.
         let local = await GamePackageAcquirer.acquire(services: services)
         if let existing = local.installation, existing.integrity == .verified {
             await reload()
@@ -233,69 +315,170 @@ public final class AppState {
             return
         }
 
-        status = "Checking Google Play…"
-        let auth = await PlaySessionStore.harvestFromWebKit(email: playAccountLabel.isEmpty ? nil : playAccountLabel)
+        status = "Checking Google Play session…"
+        var auth = await PlaySessionStore.harvestFromWebKit(email: playAccountLabel.isEmpty ? nil : playAccountLabel)
         if auth.cookies.isEmpty {
-            status = "No Google Play session — sign in with the account that owns Minecraft"
+            auth = PlaySessionStore.load()
+        }
+
+        var oauth = HarborPlayTokenBridge.loadOAuthToken()
+        if oauth == nil, auth.cookies["oauth_token"] != nil {
+            oauth = auth.cookies["oauth_token"]
+            if let oauth { HarborPlayTokenBridge.saveOAuthToken(oauth) }
+        }
+
+        // Path A requires Android setup oauth_token — not only website cookies.
+        if oauth == nil {
+            status = "Need Play client token (oauth_token) — open Android Google setup once"
             needsOnboarding = true
             refreshGate()
-            return
+            await googleSignIn(fresh: true)
+            auth = await PlaySessionStore.harvestFromWebKit(email: playAccountLabel.isEmpty ? nil : playAccountLabel)
+            if auth.cookies.isEmpty { auth = PlaySessionStore.load() }
+            oauth = HarborPlayTokenBridge.loadOAuthToken()
+            if oauth == nil { oauth = auth.cookies["oauth_token"] }
+            if oauth == nil {
+                status = "oauth_token not captured yet. In the Google window finish Android setup (I agree) until status shows oauth_token, then Install again."
+                return
+            }
         }
 
-        let listing = await PlayStoreInspector().inspect(auth: auth)
-        status = listing.summary
-
-        if listing.showsOwned || listing.installOnDevices {
-            // Try delivery anyway; if Google blocks unofficial clients, explain owned + blocked.
-            status = "You already purchased — trying Play download for owned Minecraft…"
-        } else if listing.showsBuy && !listing.showsOwned {
-            status = "\(listing.summary). If you purchased Minecraft, sign in with that same Google account."
-            return
+        if auth.cookies.isEmpty {
+            auth = PlaySessionStore.load()
         }
 
-        status = "Downloading Minecraft from Google Play…"
+        // Resolve email/user_id without bouncing to login when token already exists.
+        var email = playAccountLabel.contains("@") ? playAccountLabel : nil
+        if email == nil, auth.accountEmail?.contains("@") == true { email = auth.accountEmail }
+        if email == nil, let e = auth.cookies["Email"], e.contains("@") { email = e }
+        if email == nil, let e = HarborPlayTokenBridge.loadAccountEmail() { email = e }
+        let userID = auth.cookies["user_id"] ?? email ?? "play-user"
+
+        if email == nil || playAccountLabel == "Google Play account" || playAccountLabel.isEmpty {
+            let listing = await PlayStoreInspector().inspect(auth: auth)
+            if let e = listing.accountEmail { email = e; HarborPlayTokenBridge.saveAccountEmail(e) }
+            status = "Play client token ready. \(listing.summary)"
+        } else if let email {
+            status = "Signed in as \(email) — installing with Harbor Play client…"
+        } else {
+            status = "Play client token ready — installing with Harbor Play client…"
+        }
+        if let email, email.contains("@") {
+            playAccountLabel = email
+        } else if playAccountLabel.isEmpty || playAccountLabel == "Google Play account" {
+            playAccountLabel = "Play user \(userID.prefix(8))…"
+        }
+
+        let client = HarborPlayClient()
+
+        var credential: HarborPlayClient.Credential?
+        do {
+            credential = try await client.authorize(
+                accessToken: oauth,
+                email: email,
+                userID: userID,
+                cookieSession: auth
+            )
+            status = "Play client authorized — downloading…"
+        } catch let error as HarborError {
+            switch error {
+            case .reauthenticationRequired:
+                // Only re-login when we truly have no Play token. "Sign in again" is not the default.
+                if oauth == nil {
+                    status = "No Play client token — opening Android Google setup once"
+                    await googleSignIn(fresh: true)
+                    auth = PlaySessionStore.load()
+                    oauth = HarborPlayTokenBridge.loadOAuthToken() ?? auth.cookies["oauth_token"]
+                    if let oauth {
+                        credential = try? await client.authorize(
+                            accessToken: oauth,
+                            email: email ?? (auth.accountEmail?.contains("@") == true ? auth.accountEmail : nil),
+                            userID: auth.cookies["user_id"] ?? userID,
+                            cookieSession: auth
+                        )
+                    } else {
+                        status = "oauth_token still missing. Settings → Sign in again (fresh), finish Android setup until status shows oauth_token."
+                    }
+                } else {
+                    status = "Play token exists; Google still rejected auth. Do not sign in again — token exchange failed."
+                }
+            case .providerFailure(let reason):
+                status = "\(reason) — if oauth_token is already captured, do not Sign in again; try Settings → fresh setup only when token is missing, or Install from APK."
+            default:
+                status = error.localizedDescription
+            }
+        } catch {
+            status = error.localizedDescription
+        }
+
+        if let credential {
+            do {
+                let version = try await client.latestVersion(credential: credential)
+                status = "Play version \(version.versionName ?? String(version.versionCode)) — downloading…"
+                let staging = services.paths.stagingCache
+                    .appendingPathComponent("harbor-play-\(UUID().uuidString)", isDirectory: true)
+                let files = try await client.downloadDelivery(
+                    versionCode: version.versionCode,
+                    credential: credential,
+                    outputDirectory: staging
+                )
+                status = "Downloaded \(files.count) APK file(s) — installing…"
+                let versionName = version.versionName ?? "play-\(version.versionCode)"
+                let dest = GamePackageAcquirer.harborInstallRoot().appendingPathComponent(versionName, isDirectory: true)
+                try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+                if let extractor = findExtractor() {
+                    let process = Process()
+                    process.executableURL = extractor
+                    process.arguments = files.map(\.fileURL.path) + [dest.path]
+                    try process.run()
+                    process.waitUntilExit()
+                } else {
+                    _ = try await GamePackageAcquirer.extractAPK(files[0].fileURL, services: services)
+                    await reload()
+                    status = "Installed via Harbor Play client"
+                    return
+                }
+                let install = try await GamePackageAcquirer.importIntoHarbor(from: dest, services: services)
+                await reload()
+                status = "Installed via Harbor Play client — \(install.originalVersionName)"
+                return
+            } catch {
+                status = "Harbor Play download failed: \(error.localizedDescription)"
+                return
+            }
+        }
+
+        // Signed-in fallback: cookie-based Play probe (does not require another login).
+        status = "Trying Play download with existing session…"
         do {
             let staging = services.paths.stagingCache
-                .appendingPathComponent("play-\(UUID().uuidString)", isDirectory: true)
+                .appendingPathComponent("play-web-\(UUID().uuidString)", isDirectory: true)
             let result = try await PlayDeliveryClient().downloadPackage(auth: auth, into: staging)
-            status = "Play download complete (\(result.fileCount) file(s)) — installing…"
-            let version = result.versionName == "unknown" ? "play-\(result.fileCount)parts" : result.versionName
-            let dest = GamePackageAcquirer.harborInstallRoot().appendingPathComponent(version, isDirectory: true)
-            try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+            status = "Play session download complete (\(result.fileCount)) — installing…"
             let apks = ((try? FileManager.default.contentsOfDirectory(at: result.packageDirectory, includingPropertiesForKeys: nil)) ?? [])
                 .filter { $0.pathExtension.lowercased() == "apk" }
-            if let extractor = findExtractor(), !apks.isEmpty {
-                let process = Process()
-                process.executableURL = extractor
-                process.arguments = apks.map(\.path) + [dest.path]
-                try process.run()
-                process.waitUntilExit()
-            } else if let first = apks.first {
+            if let first = apks.first {
                 _ = try await GamePackageAcquirer.extractAPK(first, services: services)
                 await reload()
-                status = "Installed from Play download"
-                return
+                status = "Installed from Play session download"
             } else {
-                status = ownedDeliveryBlockedMessage(listing)
-                return
+                status = Self.packageNeededMessage(details: "Play returned no APK files")
             }
-            let install = try await GamePackageAcquirer.importIntoHarbor(from: dest, services: services)
-            await reload()
-            status = "Installed from Google Play — \(install.originalVersionName)"
         } catch {
-            if listing.showsOwned || listing.installOnDevices {
-                status = ownedDeliveryBlockedMessage(listing) + " Detail: \(error.localizedDescription)"
-            } else {
-                status = "Play install failed: \(error.localizedDescription) | \(listing.summary)"
-            }
+            status = Self.packageNeededMessage(details: error.localizedDescription)
         }
+        await reload()
     }
 
-    private func ownedDeliveryBlockedMessage(_ listing: PlayStoreInspector.Listing) -> String {
+    /// Clear UX when Google will not hand APKs to Harbor. Package source is the working path.
+    private static func packageNeededMessage(details: String) -> String {
         """
-        Minecraft purchase is on this Play account (\(listing.summary)), but Google rejects Harbor's APK download \
-        (DF-DFERH-01 / unofficial client). Install Minecraft on an Android phone with this account, \
-        then use Install from APK / folder… — or keep waiting for a full Play client login in Harbor.
+        Harbor cannot download Minecraft APK from Google Play right now (unofficial client blocked).\n\n\
+        Working ways to get the owned package:\n\
+        1) Open Minecraft Bedrock Launcher → Google Play login → download Minecraft → Harbor Rescan packages\n\
+        2) Home → Install from APK / folder… (owned base.apk or game folder with lib/arm64-v8a/libminecraftpe.so)\n\n\
+        Play login can still be real. This is Google delivery policy, not a Harbor account bug.\n\n\
+        Detail: \(details)
         """
     }
 
@@ -375,7 +558,19 @@ public final class AppState {
             status = "Game running (pid \(session.processIdentifier.map(String.init) ?? "?"))"
         } catch {
             isGameRunning = false
-            status = error.localizedDescription
+            let msg = error.localizedDescription
+            if msg.lowercased().contains("pthread_sigmask")
+                || msg.lowercased().contains("cannot locate symbol")
+                || msg.lowercased().contains("failed to load minecraft")
+                || msg.lowercased().contains("please reinstall or wait") {
+                status = """
+                Minecraft \(installation.originalVersionName) failed to start.\n\
+                Harbor applies official mcpelauncher-updates patches on launch when available.\n\
+                Check Settings → Doctor, or re-import an owned APK. Detail: \(msg)
+                """
+            } else {
+                status = msg
+            }
         }
     }
 
@@ -458,12 +653,19 @@ public struct OnboardingView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(app.signInBusy)
             } else {
-                Text("Signed in as \(app.playAccountLabel.isEmpty ? "Google Play" : app.playAccountLabel)")
+                Text("Play account ready: \(app.playAccountLabel.isEmpty ? "Google Play" : app.playAccountLabel)")
                     .foregroundStyle(.green)
                     .font(.headline)
             }
 
-            Button("I have an APK — skip Play") {
+            Button {
+                app.openPackageSourceLauncher()
+            } label: {
+                Label("Open Minecraft Bedrock Launcher to download package", systemImage: "shippingbox")
+            }
+            .buttonStyle(.bordered)
+
+            Button("I have an APK — skip Play download") {
                 app.useLocalAPK()
             }
             .buttonStyle(.link)
@@ -517,19 +719,37 @@ public struct HomeView: View {
                         .buttonStyle(.borderedProminent)
                         .disabled(app.signInBusy)
                     case 2:
-                        Button {
-                            Task { await app.installGame() }
-                        } label: {
-                            Label(
-                                app.isInstalling ? "Downloading from Play…" : "Install Minecraft from Play",
-                                systemImage: "icloud.and.arrow.down"
-                            )
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
+                        VStack(spacing: 10) {
+                            Button {
+                                Task { await app.installGame() }
+                            } label: {
+                                Label(
+                                    app.isInstalling ? "Working…" : "Install / import Minecraft",
+                                    systemImage: "icloud.and.arrow.down"
+                                )
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(app.isInstalling)
+
+                            Button {
+                                app.openPackageSourceLauncher()
+                            } label: {
+                                Label("Open Minecraft Bedrock Launcher (Play download source)", systemImage: "shippingbox")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+
+                            HStack(spacing: 12) {
+                                Button("Rescan packages") {
+                                    Task { await app.rescanPackages() }
+                                }
+                                Button("Install from APK / folder…") { app.importAPK() }
+                            }
+                            .font(.caption)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(app.isInstalling)
                     default:
                         HStack(spacing: 12) {
                             Button {
@@ -575,7 +795,11 @@ public struct HomeView: View {
                 HStack(spacing: 16) {
                     Button("Open Minecraft on Play Store") { app.openPlayStoreListing() }
                         .buttonStyle(.link)
+                    Button("Package source launcher…") { app.openPackageSourceLauncher() }
+                        .buttonStyle(.link)
                     Button("Install from APK / folder…") { app.importAPK() }
+                        .buttonStyle(.link)
+                    Button("Rescan packages") { Task { await app.rescanPackages() } }
                         .buttonStyle(.link)
                     Button("Run setup again") { app.resetSetup() }
                         .buttonStyle(.link)
@@ -601,7 +825,13 @@ public struct SettingsView: View {
             Section("Account") {
                 LabeledContent("Google Play", value: app.isPlaySignedIn ? app.playAccountLabel : "Not signed in")
                 Button("Sign in again") {
-                    Task { await app.googleSignIn() }
+                    Task { await app.googleSignIn(fresh: true) }
+                }
+                Button("Open package source launcher") {
+                    app.openPackageSourceLauncher()
+                }
+                Button("Rescan packages") {
+                    Task { await app.rescanPackages() }
                 }
                 Button("Show setup steps") {
                     app.resetSetup()

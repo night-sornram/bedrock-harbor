@@ -206,7 +206,7 @@ public struct GamePackageAcquirer: Sendable {
 
         return Result(
             installation: nil,
-            message: "No Minecraft package found on this Mac. Harbor Play download requires sign-in + ownership (feasibility gate).",
+            message: "No Minecraft package on this Mac yet. Download once in Minecraft Bedrock Launcher (Google Play), or import an owned APK/folder. Harbor Play client cannot fetch APKs from Google right now.",
             didImport: false
         )
     }

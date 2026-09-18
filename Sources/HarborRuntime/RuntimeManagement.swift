@@ -73,12 +73,27 @@ public struct MCLauncherClientLayout: Sendable, Hashable {
         self.forceOpenGLES = forceOpenGLES
     }
 
-    public var preferredWorkingDirectory: URL { executableURL.deletingLastPathComponent() }
+    /// hugonote-compatible working directory: runtime root when client lives in MacOS/.
+    public var preferredWorkingDirectory: URL {
+        let macos = executableURL.deletingLastPathComponent()
+        if macos.lastPathComponent == "MacOS" {
+            return macos.deletingLastPathComponent()
+        }
+        return macos
+    }
 
-    public func arguments(dataDirectory: URL, cacheDirectory: URL, extraMods: [String] = []) -> [String] {
+    public func arguments(
+        dataDirectory: URL,
+        cacheDirectory: URL,
+        extraMods: [String] = [],
+        compatibilityPatchPath: URL? = nil
+    ) -> [String] {
         var args = ["--disable-fmod"]
         if forceOpenGLES { args += ["-fes"] }
-        let mods = modsDirectories + extraMods
+        var mods = modsDirectories + extraMods
+        if let compatibilityPatchPath {
+            mods.append(compatibilityPatchPath.path)
+        }
         if !mods.isEmpty { args += ["-m", mods.joined(separator: ",")] }
         args += ["-dd", dataDirectory.path, "-dc", cacheDirectory.path, "-dg", gameDirectoryURL.path]
         return args
@@ -257,11 +272,11 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         if let bundle = LocalRuntimeDiscovery().discoverDefault() {
             await registerLayout(bundle.layout)
             let install = bundle.gameInstallation.integrity == .verified ? bundle.gameInstallation : installation
-            return try makePlan(profile: profile, installation: install, runtime: bundle.runtimeInstallation, layout: bundle.layout)
+            return try await makePlan(profile: profile, installation: install, runtime: bundle.runtimeInstallation, layout: bundle.layout)
         }
         if let layout = layouts[runtime.releaseID],
            FileManager.default.isExecutableFile(atPath: layout.executableURL.path) {
-            return try makePlan(profile: profile, installation: installation, runtime: runtime, layout: layout)
+            return try await makePlan(profile: profile, installation: installation, runtime: runtime, layout: layout)
         }
         throw HarborError.unsupportedRuntime(
             reason: "No Harbor private runtime under Application Support/BedrockHarbor/Runtimes"
@@ -273,7 +288,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         installation: InstalledMinecraft,
         runtime: RuntimeInstallation,
         layout: MCLauncherClientLayout
-    ) throws -> LaunchPlan {
+    ) async throws -> LaunchPlan {
         try paths.ensurePrivateDirectoryLayout()
         let root = paths.gameDataDirectory.appendingPathComponent(profile.dataRootID, isDirectory: true)
         let cache = paths.gameCache.appendingPathComponent(profile.dataRootID, isDirectory: true)
@@ -292,9 +307,35 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         environment["BH_SESSION_PROFILE"] = profile.id.uuidString
         environment["BH_SESSION_RUNTIME"] = runtime.releaseID
 
+        // Official mcpelauncher-updates compatibility mod (same public moddb as other launchers).
+        // The mod patches at runtime; game libraries are never copied into the package.
+        var compatibilityPatchURL: URL?
+        let gameURL = URL(fileURLWithPath: installation.relativeGameDirectory, isDirectory: true)
+        do {
+            compatibilityPatchURL = try await HarborCompatibilityPatches.prepareForLaunch(
+                gameDirectory: gameURL,
+                versionName: installation.originalVersionName,
+                versionCode: installation.buildID.versionCode
+            )
+        } catch let error as HarborError {
+            // A game version positively known to be unsupported must not launch (guaranteed
+            // startup crash); patch-fetch failures degrade to launching without the mod.
+            if case .compatibilityBlocked = error { throw error }
+            compatibilityPatchURL = nil
+        } catch {
+            compatibilityPatchURL = nil
+        }
+        if let patch = compatibilityPatchURL {
+            environment["BH_COMPAT_PATCH"] = patch.path
+        }
+
         return LaunchPlan(
             executableURL: layout.executableURL,
-            arguments: layout.arguments(dataDirectory: root, cacheDirectory: cache),
+            arguments: layout.arguments(
+                dataDirectory: root,
+                cacheDirectory: cache,
+                compatibilityPatchPath: compatibilityPatchURL
+            ),
             workingDirectoryURL: layout.preferredWorkingDirectory,
             environment: environment,
             gameDataDirectoryURL: root,

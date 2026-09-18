@@ -5,9 +5,8 @@ import HarborGooglePlay
 import SwiftUI
 import WebKit
 
-/// Real Google sign-in window (WKWebView).
-/// After Google login the browser often continues to play.google.com — that is expected.
-/// Harbor treats that as sign-in complete and returns you to the app.
+/// Real Google sign-in window (WKWebView) for Path A Android setup.
+/// Completes only when a Play client token (oauth_token) is captured, not on website login alone.
 @MainActor
 @Observable
 public final class GoogleSignInController {
@@ -19,28 +18,49 @@ public final class GoogleSignInController {
     public private(set) var didFinish = false
     public private(set) var lastError: String?
     public private(set) var reachedPlayStore = false
+    public private(set) var capturedOAuthToken = false
 
     private var window: NSWindow?
     private weak var webView: WKWebView?
+    private var navigationBridge: Bridge?
+    private var harvestTimer: Timer?
+    private var freshLogin = false
 
-    public static let startURL = URL(string: "https://accounts.google.com/ServiceLogin?service=androiddeveloper&continue=https%3A%2F%2Fplay.google.com%2Fstore&hl=en")!
+    public static let startURL = URL(string: "https://accounts.google.com/embedded/setup/v2/android?source=com.android.settings&xoauth_display_name=Android%20Phone&canFrp=1&canSk=1&lang=en&langCountry=en_us&hl=en-US&cc=us")!
 
-    public func present() {
+    public func present(freshLogin: Bool = false) {
+        self.freshLogin = freshLogin
         lastError = nil
         didFinish = false
         reachedPlayStore = false
-        signedInEmail = nil
-        status = "Loading Google sign-in…"
+        signedInEmail = HarborPlayTokenBridge.loadAccountEmail()
+        capturedOAuthToken = HarborPlayTokenBridge.loadOAuthToken() != nil
+        status = freshLogin ? "Clearing Google session for a fresh Android setup…" : "Loading Google sign-in…"
         isPresented = true
 
-        // Persistent store so Play download can reuse the Google session cookies.
         let store = WKWebsiteDataStore.default()
         let config = WKWebViewConfiguration()
         config.websiteDataStore = store
+
+        if freshLogin {
+            HarborPlayTokenBridge.clearOAuthToken()
+            Task { @MainActor in
+                await Self.clearGoogleCookies(store: store)
+            }
+        }
+
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 520, height: 560), configuration: config)
-        webView.navigationDelegate = Bridge(owner: self)
+        // WKNavigationDelegate is weak — keep the bridge alive on the controller.
+        let bridge = Bridge(owner: self)
+        navigationBridge = bridge
+        webView.navigationDelegate = bridge
         self.webView = webView
-        webView.load(URLRequest(url: Self.startURL))
+        // Small delay on fresh login so cookies clear before first request.
+        let delay: TimeInterval = freshLogin ? 0.35 : 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.isPresented, !self.didFinish else { return }
+            webView.load(URLRequest(url: Self.startURL))
+        }
 
         if window == nil {
             let panel = NSPanel(
@@ -59,7 +79,7 @@ public final class GoogleSignInController {
         guard let window else { return }
 
         let root = NSView(frame: NSRect(x: 0, y: 0, width: 540, height: 720))
-        let header = NSTextField(labelWithString: "Sign in with Google — use the account that owns Minecraft")
+        let header = NSTextField(labelWithString: "Sign in with Google — account that owns Minecraft")
         header.font = .boldSystemFont(ofSize: 13)
         header.frame = NSRect(x: 16, y: 680, width: 500, height: 20)
         header.autoresizingMask = [.width]
@@ -80,7 +100,7 @@ public final class GoogleSignInController {
         done.frame = NSRect(x: 280, y: 12, width: 240, height: 32)
         done.autoresizingMask = [.minXMargin, .maxYMargin]
 
-        let hint = NSTextField(labelWithString: "If you land on Play Store after login, that is normal — click Done.")
+        let hint = NSTextField(labelWithString: "Finish Android setup (I agree) until status shows oauth_token.")
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .secondaryLabelColor
         hint.frame = NSRect(x: 16, y: 20, width: 260, height: 28)
@@ -95,15 +115,37 @@ public final class GoogleSignInController {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         refreshStatusLabels()
+        startHarvestTimer()
     }
 
     @objc private func doneTapped() {
-        finish(email: signedInEmail)
+        finish(email: signedInEmail, userInitiated: true)
     }
 
     public func dismiss() {
+        harvestTimer?.invalidate()
+        harvestTimer = nil
         window?.orderOut(nil)
         isPresented = false
+    }
+
+    private static func clearGoogleCookies(store: WKWebsiteDataStore) async {
+        let cookies = await store.httpCookieStore.allCookies()
+        for cookie in cookies where cookie.domain.lowercased().contains("google") {
+            await store.httpCookieStore.delete(cookie)
+        }
+        PlaySessionStore.save(cookies: [:], email: nil)
+    }
+
+    private func startHarvestTimer() {
+        harvestTimer?.invalidate()
+        harvestTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isPresented, !self.didFinish else { return }
+                await self.harvestAndroidSetupCookies()
+                await self.scrapePageIdentity()
+            }
+        }
     }
 
     fileprivate func noteNavigation(url: URL?) {
@@ -112,49 +154,127 @@ public final class GoogleSignInController {
         status = "Page: \(host.isEmpty ? url.absoluteString : host)"
         refreshStatusLabels()
 
+        if let token = HarborPlayTokenBridge.token(from: url) {
+            HarborPlayTokenBridge.saveOAuthToken(token)
+            capturedOAuthToken = true
+            status = "Captured Play token from URL"
+            refreshStatusLabels()
+        }
+
+        if host.contains("google.com") {
+            Task { await self.harvestAndroidSetupCookies(); await self.scrapePageIdentity() }
+        }
+
         if host.hasSuffix("play.google.com") {
             reachedPlayStore = true
-            status = "Play Store opened — sign-in looks complete. Click Done to return to Harbor."
+            status = "Play Store opened — harvesting credentials…"
             refreshStatusLabels()
-            // Auto-complete after landing on Play Store (normal Google continue URL).
-            extractEmailThenFinish()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, !self.didFinish else { return }
+                Task { await self.harvestAndroidSetupCookies(); await self.scrapePageIdentity() }
+            }
         }
     }
 
-    private func extractEmailThenFinish() {
-        webView?.evaluateJavaScript(
-            """
-            (function(){
-              try {
-                var t = document.title || '';
-                var m = document.body ? (document.body.innerText || '') : '';
-                var re = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/ig;
-                var s = (t + '\\n' + m).match(re);
-                return s && s.length ? s[0] : null;
-              } catch (e) { return null; }
-            })();
-            """
-        ) { [weak self] result, _ in
+    /// Collect oauth_token / Email / user_id from Android embedded setup cookies.
+    private func harvestAndroidSetupCookies() async {
+        var oauth: String?
+        var email: String?
+        var userID = ""
+        var bag: [String: String] = [:]
+        let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
+        for cookie in cookies {
+            let host = cookie.domain.lowercased()
+            guard host.contains("google.com") || host.contains("play.google.com") else { continue }
+            bag[cookie.name] = cookie.value
+            if cookie.name == "oauth_token", !cookie.value.isEmpty, cookie.value != oauth {
+                oauth = cookie.value
+            }
+            if (cookie.name == "Email" || cookie.name == "email"), cookie.value.contains("@") {
+                email = cookie.value
+            }
+            if cookie.name == "user_id", !cookie.value.isEmpty { userID = cookie.value }
+        }
+        if let oauth {
+            HarborPlayTokenBridge.saveOAuthToken(oauth)
+            capturedOAuthToken = true
+            status = "Captured oauth_token (\(oauth.prefix(12))…)"
+            refreshStatusLabels()
+        }
+        if let email {
+            signedInEmail = email
+            HarborPlayTokenBridge.saveAccountEmail(email)
+            if oauth == nil {
+                status = "Account \(email) — still waiting for oauth_token"
+            } else if status.isEmpty || status.hasPrefix("Page:") {
+                status = "Account \(email) + oauth_token"
+            }
+            refreshStatusLabels()
+        }
+        if !userID.isEmpty, bag["user_id"] == nil {
+            bag["user_id"] = userID
+        }
+        if !bag.isEmpty {
+            PlaySessionStore.save(cookies: bag, email: email ?? signedInEmail)
+        }
+        // Path A complete only with oauth_token. Email is preferred but not required.
+        if HarborPlayTokenBridge.loadOAuthToken() != nil || oauth != nil, !didFinish {
+            finish(email: email ?? signedInEmail, userInitiated: false)
+        }
+    }
+
+    private func scrapePageIdentity() async {
+        guard let webView else { return }
+        let js = """
+        (function(){
+          try {
+            var blob = (document.title || '') + '\\n' + (document.body ? (document.body.innerText || '') : '') + '\\n' + (document.documentElement ? (document.documentElement.innerHTML || '') : '');
+            var emailRe = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/ig;
+            var emails = blob.match(emailRe) || [];
+            var preferred = null;
+            for (var i = 0; i < emails.length; i++) {
+              var e = emails[i];
+              if (/@(gmail|googlemail)\\.com$/i.test(e) || /@(google)\\.com$/i.test(e)) { preferred = e; break; }
+            }
+            if (!preferred && emails.length) preferred = emails[0];
+            var token = null;
+            var m = blob.match(/oauth_token=([A-Za-z0-9_\\-\\.\\/]{20,})/);
+            if (m) token = m[1];
+            var ya = blob.match(/ya29\\.[A-Za-z0-9_\\-\\.]{20,}/);
+            if (!token && ya) token = ya[0];
+            var oauth2 = blob.match(/oauth2_[0-9]+\\/[A-Za-z0-9_\\-\\.]{20,}/);
+            if (!token && oauth2) token = oauth2[0];
+            return { email: preferred, token: token };
+          } catch (e) { return null; }
+        })();
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
             guard let self else { return }
             Task { @MainActor in
-                var email = (result as? String).flatMap { $0.contains("@") ? $0 : nil }
-                if email == nil { email = self.signedInEmail ?? "Google Play account" }
-                self.signedInEmail = email
-                await self.captureCookiesAndFinish(email: email)
+                if let dict = result as? [String: Any] {
+                    if let token = dict["token"] as? String, !token.isEmpty {
+                        HarborPlayTokenBridge.saveOAuthToken(token)
+                        self.capturedOAuthToken = true
+                    }
+                    if let email = dict["email"] as? String, email.contains("@") {
+                        self.signedInEmail = email
+                        HarborPlayTokenBridge.saveAccountEmail(email)
+                        PlaySessionStore.save(cookies: PlaySessionStore.load().cookies, email: email)
+                    }
+                } else if let email = result as? String, email.contains("@") {
+                    self.signedInEmail = email
+                    HarborPlayTokenBridge.saveAccountEmail(email)
+                }
+                if let token = HarborPlayTokenBridge.loadOAuthToken() {
+                    self.capturedOAuthToken = true
+                    _ = token
+                    if !self.didFinish {
+                        self.finish(email: self.signedInEmail, userInitiated: false)
+                    }
+                }
+                self.refreshStatusLabels()
             }
         }
-    }
-
-    /// Persist Google cookies for Play Store download.
-    private func captureCookiesAndFinish(email: String?) async {
-        var bag: [String: String] = [:]
-        if let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies() as [HTTPCookie]? {
-            for cookie in cookies where cookie.domain.contains("google.com") || cookie.domain.contains("play.google.com") {
-                bag[cookie.name] = cookie.value
-            }
-        }
-        PlaySessionStore.save(cookies: bag, email: email)
-        finish(email: email)
     }
 
     fileprivate func noteFail(message: String) {
@@ -163,26 +283,66 @@ public final class GoogleSignInController {
         refreshStatusLabels()
     }
 
-    public func finish(email: String?) {
-        if let email, email.contains("@") {
-            signedInEmail = email
-        } else {
-            signedInEmail = signedInEmail ?? "Google Play account"
+    public func finish(email: String?, userInitiated: Bool = true) {
+        var resolvedEmail = email
+        if resolvedEmail == nil || !(resolvedEmail?.contains("@") ?? false) {
+            resolvedEmail = HarborPlayTokenBridge.loadAccountEmail()
         }
-        status = "Signed in as \(signedInEmail ?? "Google Play account")"
+        if resolvedEmail == nil || !(resolvedEmail?.contains("@") ?? false) {
+            resolvedEmail = signedInEmail
+        }
+        if let resolvedEmail, resolvedEmail.contains("@") {
+            signedInEmail = resolvedEmail
+            HarborPlayTokenBridge.saveAccountEmail(resolvedEmail)
+        }
+
+        let token = HarborPlayTokenBridge.loadOAuthToken()
+            ?? PlaySessionStore.load().cookies["oauth_token"]
+        if let token {
+            HarborPlayTokenBridge.saveOAuthToken(token)
+            capturedOAuthToken = true
+        }
+
+        if token == nil && userInitiated {
+            status = "oauth_token not captured yet — finish Android setup (I agree), then Done"
+            lastError = status
+            refreshStatusLabels()
+            // Still return control, but do not claim success.
+            didFinish = true
+            dismiss()
+            NotificationCenter.default.post(name: .bhGoogleSignInFinished, object: self)
+            return
+        }
+
+        if token != nil {
+            status = "Play token ready\(resolvedEmail.map { " as \($0)" } ?? "")"
+        } else {
+            status = "Signed in as \(resolvedEmail ?? "Google Play account") — no oauth_token"
+        }
         didFinish = true
         refreshStatusLabels()
-        // Always persist Play cookies before signaling completion.
         Task { @MainActor in
             var bag: [String: String] = [:]
+            var oauth: String?
+            var email = self.signedInEmail
+            var userID = ""
             let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
             for cookie in cookies {
                 let host = cookie.domain.lowercased()
-                if host.contains("google.com") || host.contains("play.google.com") || host.contains("googleapis.com") {
-                    bag[cookie.name] = cookie.value
-                }
+                if !(host.contains("google.com") || host.contains("play.google.com") || host.contains("googleapis.com")) { continue }
+                bag[cookie.name] = cookie.value
+                if cookie.name == "oauth_token", !cookie.value.isEmpty { oauth = cookie.value }
+                if (cookie.name == "Email" || cookie.name == "email"), cookie.value.contains("@") { email = cookie.value }
+                if cookie.name == "user_id", !cookie.value.isEmpty { userID = cookie.value }
             }
-            PlaySessionStore.save(cookies: bag, email: self.signedInEmail)
+            if let oauth {
+                HarborPlayTokenBridge.saveOAuthToken(oauth)
+            }
+            if let email {
+                HarborPlayTokenBridge.saveAccountEmail(email)
+            }
+            if !userID.isEmpty { bag["user_id"] = userID }
+            PlaySessionStore.save(cookies: bag, email: email)
             self.dismiss()
             NotificationCenter.default.post(name: .bhGoogleSignInFinished, object: self)
         }

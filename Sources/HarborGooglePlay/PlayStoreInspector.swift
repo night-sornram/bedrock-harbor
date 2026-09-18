@@ -9,6 +9,7 @@ public struct PlayStoreInspector: Sendable {
         public var showsOwned: Bool
         public var priceSnippet: String?
         public var installOnDevices: Bool
+        public var accountEmail: String?
         public var summary: String
     }
 
@@ -32,6 +33,7 @@ public struct PlayStoreInspector: Sendable {
                 showsOwned: false,
                 priceSnippet: nil,
                 installOnDevices: false,
+                accountEmail: nil,
                 summary: "Could not read Play Store listing: \(error.localizedDescription)"
             )
         }
@@ -57,6 +59,28 @@ public struct PlayStoreInspector: Sendable {
            let r = Range(m.range(at: 2), in: html) {
             price = String(html[r])
         }
+        var accountEmail: String?
+        if let regex = try? NSRegularExpression(pattern: "[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", options: [.caseInsensitive]) {
+            let ns = NSRange(html.startIndex..<html.endIndex, in: html)
+            var found: [String] = []
+            for match in regex.matches(in: html, range: ns).prefix(20) {
+                if let r = Range(match.range, in: html) {
+                    let e = String(html[r])
+                    if e.lowercased().hasSuffix("@gmail.com") || e.lowercased().hasSuffix("@googlemail.com") {
+                        found.append(e)
+                    }
+                }
+            }
+            if found.isEmpty {
+                for match in regex.matches(in: html, range: ns).prefix(8) {
+                    if let r = Range(match.range, in: html) {
+                        let e = String(html[r])
+                        if !e.lowercased().contains("example") && !e.contains("@2x") { found.append(e) }
+                    }
+                }
+            }
+            accountEmail = found.first
+        }
 
         var summary: String
         if owned {
@@ -73,6 +97,7 @@ public struct PlayStoreInspector: Sendable {
             showsOwned: owned,
             priceSnippet: price,
             installOnDevices: installDevices,
+            accountEmail: accountEmail,
             summary: summary
         )
     }
