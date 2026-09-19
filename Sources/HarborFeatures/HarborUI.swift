@@ -187,12 +187,35 @@ public final class AppState {
         installations = (try? await services.metadata.loadInstallations()) ?? []
         runtimes = (try? await services.metadata.loadRuntimeInstallations()) ?? []
         accounts = (try? await services.metadata.loadAccounts()) ?? []
+        await reconcilePersistedPlaySession()
         if let ready = accounts.first(where: { $0.sessionState == .ready }) {
             playAccountLabel = ready.accountLabel
         }
         if selectedProfileID == nil { selectedProfileID = profiles.first?.id }
         refreshGate()
         status = status.isEmpty ? readySummary() : status
+    }
+
+    /// A stored Play token sitting on an anonymous cookie bag (no oauth_token
+    /// cookie, no Google session cookies) cannot install anything — it is a
+    /// leftover from a login that faked completion. Clear it instead of
+    /// claiming "Google Play ready" for a session that never really signed in.
+    private func reconcilePersistedPlaySession() async {
+        let session = PlaySessionStore.load()
+        let hasSessionCookies = [
+            "SID", "SAPISID", "HSID", "LSID", "SIDCC",
+            "__Secure-3PSID", "__Secure-3PAPISID",
+        ].contains { session.cookies[$0] != nil }
+        let hasPlayAccount = accounts.contains { $0.providerID == .googlePlay }
+        guard session.cookies["oauth_token"] == nil,
+              !hasSessionCookies,
+              HarborPlayTokenBridge.loadOAuthToken() != nil || hasPlayAccount
+        else { return }
+        HarborPlayTokenBridge.clearOAuthToken()
+        PlaySessionStore.save(cookies: [:], email: nil)
+        accounts.removeAll { $0.providerID == .googlePlay }
+        try? await services.metadata.saveAccounts(accounts)
+        playAccountLabel = ""
     }
 
     private func readySummary() -> String {

@@ -4,6 +4,7 @@ import Testing
 import HarborApplication
 import HarborCompatibility
 import HarborDomain
+import HarborGooglePlay
 import HarborPlatform
 
 @MainActor
@@ -104,5 +105,54 @@ struct AppStateInstallGateTests {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         #expect(app.hasVerifiedGame, "metadata appeared while app ran — UI must reflect it without user action")
+    }
+
+    /// The Play store is process-global (UserDefaults + real-home files), so
+    /// parallel tests would race on it — one test, sequential phases.
+    private func resetPlayState() {
+        let d = UserDefaults.standard
+        d.removeObject(forKey: "com.bedrockharbor.play.oauth")
+        d.removeObject(forKey: "com.bedrockharbor.play.cookies")
+        d.removeObject(forKey: "com.bedrockharbor.play.email")
+        let support = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BedrockHarbor", isDirectory: true)
+        try? FileManager.default.removeItem(at: support.appendingPathComponent("play-session.json"))
+        try? FileManager.default.removeItem(at: support.appendingPathComponent("play-oauth.token"))
+    }
+
+    /// A token string saved over an anonymous cookie bag is a failed-login
+    /// leftover (the loop bug): reload must self-heal to signed-out, not claim
+    /// "Google Play ready" for a session that never signed in. A completed
+    /// sign-in (oauth_token cookie in the bag) must survive the same reload.
+    @Test func playSessionSelfHealsFromAnonymousLeftover() async throws {
+        resetPlayState()
+        defer { resetPlayState() }
+
+        // Phase 1: anonymous leftover → signed out + cleared.
+        let stale = try makeServices()
+        HarborPlayTokenBridge.saveOAuthToken("oauth2_4/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB")
+        PlaySessionStore.save(cookies: ["NID": "n", "OTZ": "o"], email: "a@gmail.com")
+        try await stale.metadata.saveAccounts([
+            AccountRecord(
+                providerID: .googlePlay,
+                accountLabel: "a@gmail.com",
+                sessionState: .ready,
+                keychainReference: "test"
+            )
+        ])
+        let staleApp = AppState(services: stale)
+        await staleApp.reload()
+        #expect(!staleApp.isPlaySignedIn, "anonymous cookie bag must not count as signed in")
+        #expect(HarborPlayTokenBridge.loadOAuthToken() == nil, "leftover token must be cleared")
+        #expect(!staleApp.accounts.contains { $0.providerID == .googlePlay })
+
+        // Phase 2: completed sign-in → kept.
+        let live = try makeServices()
+        let token = "oauth2_4/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB"
+        HarborPlayTokenBridge.saveOAuthToken(token)
+        PlaySessionStore.save(cookies: ["oauth_token": token, "SID": "s"], email: "a@gmail.com")
+        let liveApp = AppState(services: live)
+        await liveApp.reload()
+        #expect(liveApp.isPlaySignedIn, "oauth_token cookie in the bag is a real completed sign-in")
     }
 }
