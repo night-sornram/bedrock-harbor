@@ -284,6 +284,21 @@ final class CompatibilityPatchesTests: XCTestCase {
         XCTAssertEqual(meta.version, "1.26.45.1")
     }
 
+    func testRefreshCatalogNowThrowsOnNetworkFailureEvenWithInstall() async throws {
+        // The explicit refresh must surface failures: an install already exists (the
+        // dominant case for the Settings button), but the fetch error must still throw
+        // instead of silently reporting the stale install as a successful refresh.
+        try writeInstalledPatch(catalogCheckedAt: Date())
+        HarborCompatibilityPatches.catalogLoader = { throw URLError(.timedOut) }
+
+        do {
+            _ = try await HarborCompatibilityPatches.refreshCatalogNow()
+            XCTFail("refreshCatalogNow must throw when the catalog fetch fails")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .timedOut)
+        }
+    }
+
     func testEnsureInstalledThrowsPromptlyWhenCatalogFetchStalls() async throws {
         // No install present, loader simulating a stalled request that hit the bounded
         // timeout: the error must propagate instead of hanging the launch path.

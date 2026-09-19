@@ -424,10 +424,11 @@ public struct HarborCompatibilityPatches: Sendable {
     }
 
     /// Force a catalog refresh now: resolve moddb and install when the release differs
-    /// (wired to a Settings action). Unlike the background refresh, throws on failure.
+    /// (wired to a Settings action). Throws on network failure — unlike the launch path,
+    /// an existing install is NOT a silent substitute for a successful refresh.
     @discardableResult
     public static func refreshCatalogNow() async throws -> URL {
-        try await resolveAndInstall(gameVersionName: nil)
+        try await resolveAndInstall(gameVersionName: nil, offlineFallback: false)
     }
 
     /// Minimum time between moddb consultations.
@@ -471,8 +472,10 @@ public struct HarborCompatibilityPatches: Sendable {
     /// Slow path shared by first install, uncovered game versions, and explicit refresh:
     /// resolve moddb, reuse the existing install when possible, download + install when the
     /// release differs, and stamp `catalogCheckedAt` so the daily refresh gate closes.
+    /// `offlineFallback` (the launch-path default) returns the existing install when moddb
+    /// is unreachable; the explicit refresh passes false so failures are rethrown.
     @discardableResult
-    private static func resolveAndInstall(gameVersionName: String?) async throws -> URL {
+    private static func resolveAndInstall(gameVersionName: String?, offlineFallback: Bool = true) async throws -> URL {
         let installedMeta = loadMetadata()
         let latest: (version: String, assetURL: URL, codes: [Int], names: [String])
         do {
@@ -480,7 +483,7 @@ public struct HarborCompatibilityPatches: Sendable {
         } catch {
             // Offline: keep the current install; unsupported game versions are blocked at
             // launch only when coverage data positively rules them out.
-            if let existing = installedModDirectory() { return existing }
+            if offlineFallback, let existing = installedModDirectory() { return existing }
             throw error
         }
 
