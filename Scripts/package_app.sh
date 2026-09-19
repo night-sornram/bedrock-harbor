@@ -1,12 +1,14 @@
 #!/bin/zsh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/.build/out/Products/Debug/BedrockHarbor"
 APP="${1:-/Applications/BedrockHarbor.app}"
 ID="com.bedrockharbor.app"
 ASSETS="$ROOT/Assets"
 
-swift build --package-path "$ROOT"
+# Xcode toolchain explicitly (xcode-select may point at CommandLine Tools).
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release --package-path "$ROOT"
+BIN_DIR="$(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release --package-path "$ROOT" --show-bin-path)"
+BIN="$BIN_DIR/BedrockHarbor"
 test -x "$BIN"
 
 mkdir -p "$ASSETS"
@@ -36,7 +38,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/BedrockHarbor"
 chmod 755 "$APP/Contents/MacOS/BedrockHarbor"
 # SwiftPM resource bundles — Bundle.module lookups crash the packaged app without them
-find "$ROOT/.build/out/Products/Debug" -maxdepth 1 -name "*_*.bundle" -exec cp -R {} "$APP/Contents/Resources/" \;
+find "$BIN_DIR" -maxdepth 1 -name "*_*.bundle" -exec cp -R {} "$APP/Contents/Resources/" \;
 cp "$LOGO" "$APP/Contents/Resources/BedrockHarbor.png"
 cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
 
