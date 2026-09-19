@@ -238,6 +238,61 @@ final class LaunchParameterHonoringTests: XCTestCase {
         )
     }
 
+    // MARK: - launch timing spans plan preparation
+
+    func testLaunchTimingRecordsPreparationAndPlanReadyStages() async throws {
+        try writeInstalledPatch(names: ["1.26.40.0"])
+        try makeUsableRuntimeRoot(name: "runtime", executableBytes: Data("exec".utf8))
+        let game = try makeGameInstallation(name: "1.26.40.0")
+        let paths = makePaths()
+        let supervisor = ProcessLaunchSupervisor(paths: paths)
+
+        // Real pipeline shape: the plan is prepared first (its compatibility
+        // preparation must be timed), then a real process is launched through
+        // the same supervisor, so the single persisted "launch" record must
+        // carry BOTH preparation stages AND both process stages.
+        _ = try await supervisor.prepareLaunchPlan(
+            profile: Profile(name: "Timing"),
+            installation: makeInstallation(gameDir: game, versionName: "1.26.40.0"),
+            runtime: makeRuntime(
+                root: supportRoot.appendingPathComponent("Runtimes/runtime", isDirectory: true),
+                releaseID: "harbor-test"
+            )
+        )
+        let session = try await supervisor.start(plan: LaunchPlan(
+            executableURL: URL(fileURLWithPath: "/bin/sleep"),
+            arguments: ["30"],
+            workingDirectoryURL: tempDir,
+            environment: ["PATH": "/usr/bin:/bin"],
+            gameDataDirectoryURL: tempDir.appendingPathComponent("data", isDirectory: true),
+            cacheDirectoryURL: tempDir.appendingPathComponent("cache", isDirectory: true),
+            profileID: UUID(),
+            runtimeReleaseID: "harbor-test"
+        ))
+        try await supervisor.requestTermination(sessionID: session.id)
+
+        let deadline = Date().addingTimeInterval(10)
+        var record: LaunchTimingRecord?
+        while Date() < deadline {
+            record = LaunchTimingRecorder.recentRecords(directory: paths.metadataDirectory)
+                .last { $0.kind == "launch" && $0.outcome != nil }
+            if record != nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let timing = try XCTUnwrap(record, "launch timing record must be persisted after the session ends")
+        XCTAssertEqual(timing.outcome, "cancelled")
+        XCTAssertNotNil(
+            timing.stageMarks[LaunchTimingStage.compatibilityPreparation.rawValue],
+            "launch record must time compatibility preparation"
+        )
+        XCTAssertNotNil(
+            timing.stageMarks[LaunchTimingStage.launchPlanReady.rawValue],
+            "launch record must time plan readiness"
+        )
+        XCTAssertNotNil(timing.stageMarks[LaunchTimingStage.processLaunched.rawValue])
+        XCTAssertNotNil(timing.stageMarks[LaunchTimingStage.sessionEnded.rawValue])
+    }
+
     // MARK: - pre-launch helper readiness
 
     func testPlanRefusesRuntimeWithMissingMicrosoftHelperResources() async throws {

@@ -200,9 +200,12 @@ public actor GameSessionCoordinator {
             launchReserved = false
             throw HarborError.feasibilityGateIncomplete(reason: "Runtime launcher is not composed")
         }
-        let verified = try await Self.verifyInstallation(installation, services: services)
         let owner = "session-\(UUID().uuidString)"
         do {
+            // Inside the do on purpose: the catch below owns launchReserved and
+            // the lease, so a future throwing verify path releases them instead
+            // of leaking the reservation for the rest of the app's life.
+            let verified = try await Self.verifyInstallation(installation, services: services)
             guard verified.integrity == .verified else {
                 throw HarborError.invalidPackage(
                     reason: "Game package not verified under \(installation.relativeGameDirectory). Place lib/arm64-v8a/libminecraftpe.so in BedrockHarbor/Installations."

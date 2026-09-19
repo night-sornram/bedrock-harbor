@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import HarborDomain
 import HarborPlatform
@@ -458,16 +459,29 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
     private var processes: [UUID: Process] = [:]
     private var writers: [UUID: ProcessLogWriter] = [:]
     private var stopRequested: Set<UUID> = []
+    /// SIGTERM→SIGKILL escalation tasks, one per stopped session; cancelled in
+    /// `noteExit` when the exit lands inside the grace period.
+    private var killEscalations: [UUID: Task<Void, Never>] = [:]
     private var recentSessions: [LaunchSession] = []
     private let paths: HarborPaths
     /// The recorder that owns the in-flight `launch` timing session (begun in
-    /// `start(plan:)`). Public so the UI layer can add window-appearance marks
-    /// — game window, Microsoft sign-in window — into the same session.
+    /// `makePlan` during plan preparation — or in `start(plan:)` when the plan
+    /// was not prepared here). Public so the UI layer can add window-appearance
+    /// marks — game window, Microsoft sign-in window — into the same session.
     public nonisolated let launchTiming: LaunchTimingRecorder
     private let hub = SessionEventHub()
+    /// True while the launch timing session opened by `makePlan` awaits its
+    /// `start(plan:)` call, so `start` reuses the primed session (whose record
+    /// already carries the compatibility/plan-ready marks) instead of opening
+    /// a fresh one that would drop them.
+    private var launchTimingPrimedByPlanning = false
+    /// Grace period between the polite SIGTERM and the SIGKILL escalation in
+    /// `requestTermination`. Default 10 s; tests shrink it.
+    private let terminationGraceInterval: TimeInterval
 
-    public init(paths: HarborPaths) {
+    public init(paths: HarborPaths, terminationGraceInterval: TimeInterval = 10) {
         self.paths = paths
+        self.terminationGraceInterval = terminationGraceInterval
         // Timing is diagnostics-only and records one in-flight session at a time;
         // Harbor launches one game session at a time, so this matches reality.
         self.launchTiming = LaunchTimingRecorder(directory: paths.metadataDirectory)
@@ -573,6 +587,13 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
             )
         }
         try paths.ensurePrivateDirectoryLayout()
+        // The launch timing session spans the whole pipeline: plan preparation
+        // opens it here and `start(plan:)` reuses it, so the compatibility and
+        // plan-ready stages land in the same record as the process stages.
+        // (If this plan never starts, the next `begin` simply replaces it —
+        // recorder semantics, diagnostics-only.)
+        await launchTiming.begin(kind: "launch", runtimeRelease: runtime.releaseID)
+        launchTimingPrimedByPlanning = true
         let root = paths.gameDataDirectory.appendingPathComponent(profile.dataRootID, isDirectory: true)
         let cache = paths.gameCache.appendingPathComponent(profile.dataRootID, isDirectory: true)
         for rel in [
@@ -597,6 +618,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         // preparation receipt (prepareForLaunchDetailed).
         var compatibilityPatchURL: URL?
         let gameURL = URL(fileURLWithPath: installation.relativeGameDirectory, isDirectory: true)
+        await launchTiming.mark(.compatibilityPreparation)
         do {
             compatibilityPatchURL = try await HarborCompatibilityPatches.prepareForLaunchDetailed(
                 gameDirectory: gameURL,
@@ -624,6 +646,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
             gameVersionName: installation.originalVersionName
         )
 
+        await launchTiming.mark(.launchPlanReady)
         return LaunchPlan(
             executableURL: effectiveLayout.executableURL,
             arguments: effectiveLayout.arguments(
@@ -648,7 +671,14 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         try paths.ensurePrivateDirectoryLayout()
         try FileManager.default.createDirectory(at: paths.sessionLogs, withIntermediateDirectories: true)
         let sessionID = UUID()
-        await launchTiming.begin(kind: "launch", runtimeRelease: plan.runtimeReleaseID)
+        if launchTimingPrimedByPlanning {
+            // Plan preparation already opened this launch's timing session and
+            // recorded compatibilityPreparation / launchPlanReady into it;
+            // beginning again here would wipe those marks.
+            launchTimingPrimedByPlanning = false
+        } else {
+            await launchTiming.begin(kind: "launch", runtimeRelease: plan.runtimeReleaseID)
+        }
         let logURL = paths.sessionLogs.appendingPathComponent("session-\(sessionID.uuidString).log")
         var session = LaunchSession(
             id: sessionID,
@@ -725,7 +755,11 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
             if recentSessions.count > Self.recentSessionLimit {
                 recentSessions.removeFirst(recentSessions.count - Self.recentSessionLimit)
             }
-            await hub.retainOnly(Set(recentSessions.map(\.id)))
+            // Active sessions are never in recentSessions (only ended ones are),
+            // so they must be explicitly retained — dropping their hub state
+            // mid-flight would hang every live subscriber (coordinator observer
+            // included) waiting for a terminal event that can no longer arrive.
+            await hub.retainOnly(Set(recentSessions.map(\.id)).union(active.keys))
 
             await launchTiming.mark(.sessionEnded)
             await launchTiming.end(outcome: requestedStop ? "cancelled" : (s.state == .exited ? "ok" : "failed"))
@@ -743,6 +777,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         // Closing here may drop output still buffered in the pipes (≤ pipe
         // capacity); descendant processes holding the write end would otherwise
         // keep the fd open forever. `close()` is idempotent either way.
+        killEscalations.removeValue(forKey: sessionID)?.cancel()
         writers.removeValue(forKey: sessionID)?.close()
         processes.removeValue(forKey: sessionID)
         active.removeValue(forKey: sessionID)
@@ -770,7 +805,23 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
             active[sessionID] = s
         }
         await hub.emit(RuntimeEvent(sessionID: sessionID, kind: .stopping, message: "terminate requested"))
-        if let p = processes[sessionID], p.isRunning { p.terminate() }
+        if let p = processes[sessionID], p.isRunning {
+            p.terminate()
+            // A game that traps/ignores SIGTERM must not hold the launch
+            // reservation (and the coordinator's data-root lease) forever:
+            // escalate to SIGKILL after the grace period. Signaling by pid
+            // keeps `Process` out of the task closure (same pattern as
+            // SubprocessRunner's timeout); noteExit cancels the task when the
+            // exit lands inside the grace period.
+            let pid = p.processIdentifier
+            let grace = terminationGraceInterval
+            killEscalations[sessionID]?.cancel()
+            killEscalations[sessionID] = Task {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, grace) * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                kill(pid, SIGKILL)
+            }
+        }
     }
 }
 
@@ -821,6 +872,11 @@ actor SessionEventHub {
         subscribers[sessionID]?.removeAll { $0.id == subscriberID }
     }
 
+    /// Live subscriber count for a session (test probe for subscribe/evict races).
+    func subscriberCount(_ sessionID: UUID) -> Int {
+        subscribers[sessionID]?.count ?? 0
+    }
+
     func emit(_ event: RuntimeEvent) {
         var events = history[event.sessionID] ?? []
         guard !events.contains(where: Self.isTerminal) else {
@@ -840,11 +896,17 @@ actor SessionEventHub {
     }
 
     /// Drops history for sessions that fell out of the supervisor's
-    /// `recentSessions` window.
+    /// `recentSessions` window. Every live subscriber of a dropped session has
+    /// its continuation finished first — removing it silently would hang the
+    /// subscriber's `for await` loop forever.
     func retainOnly(_ sessionIDs: Set<UUID>) {
         for id in history.keys where !sessionIDs.contains(id) {
             history.removeValue(forKey: id)
-            subscribers.removeValue(forKey: id)
+            if let evicted = subscribers.removeValue(forKey: id) {
+                for subscriber in evicted {
+                    subscriber.continuation.finish()
+                }
+            }
         }
     }
 }

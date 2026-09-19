@@ -1,4 +1,5 @@
 import Testing
+import Darwin
 import Foundation
 import HarborDomain
 import HarborPlatform
@@ -195,6 +196,117 @@ struct ProcessLaunchSupervisorTests {
         #expect(
             LaunchTimingRecorder.recentRecords(directory: paths.metadataDirectory)
                 .last(where: { $0.kind == "launch" })?.outcome == "cancelled"
+        )
+    }
+
+    // MARK: - SIGTERM ignored → SIGKILL escalation
+
+    @Test(.timeLimit(.minutes(1)))
+    func requestTerminationEscalatesToSIGKILLWhenSIGTERMIsIgnored() async throws {
+        let root = tempDir
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = makePaths(root: root)
+        try paths.ensurePrivateDirectoryLayout()
+        let supervisor = ProcessLaunchSupervisor(paths: paths, terminationGraceInterval: 1.5)
+
+        // zsh traps SIGTERM (ignored) and keeps a shell loop alive so it cannot
+        // exec-optimize the trap away: without escalation the session would
+        // hang for the full 30 s and the coordinator would keep the launch
+        // reservation (and the data-root lease) until app restart.
+        let session = try await supervisor.start(
+            plan: makePlan(executable: "/bin/zsh", root: root, arguments: ["-c", "trap '' TERM; echo READY; while :; do sleep 1; done"])
+        )
+        // SIGTERM delivered before the trap is armed would kill zsh with the
+        // default disposition and prove nothing — wait for the fixture's
+        // readiness marker in the session log.
+        let logURL = paths.sessionLogs.appendingPathComponent("session-\(session.id.uuidString).log")
+        let trapArmed = await until(timeout: 10) {
+            (try? String(contentsOf: logURL, encoding: .utf8))?.contains("READY") == true
+        }
+        #expect(trapArmed, "fixture must signal that its SIGTERM trap is armed")
+
+        let pid = try #require(session.processIdentifier)
+        let requestedAt = Date()
+        try await supervisor.requestTermination(sessionID: session.id)
+
+        let events = await collectEvents(supervisor.events(sessionID: session.id), timeout: 20)
+        #expect(events.last?.kind == .exited, "escalation must reach a terminal .exited event (user-requested stop)")
+        #expect(events.last?.exitCode == 9, "expected SIGKILL (9), got \(String(describing: events.last?.exitCode))")
+        #expect(Date().timeIntervalSince(requestedAt) < 25, "escalation must not wait out the ignored 30 s sleep")
+
+        // The process is really gone (SIGKILL cannot be trapped).
+        let gone = await until(timeout: 5) {
+            kill(pid, 0) == -1 && errno == ESRCH
+        }
+        #expect(gone, "pid \(pid) must not exist after the escalation")
+    }
+
+    // MARK: - Hub retention must finish evicted subscribers
+
+    @Test func hubRetainOnlyFinishesSubscribersOfEvictedSessions() async throws {
+        let hub = SessionEventHub()
+        let sessionID = UUID()
+        // Seed non-terminal history so a subscriber registers live.
+        await hub.emit(RuntimeEvent(sessionID: sessionID, kind: .running))
+        let stream = AsyncStream<RuntimeEvent> { continuation in
+            let subscriberID = UUID()
+            continuation.onTermination = { @Sendable _ in
+                Task { await hub.unsubscribe(sessionID, subscriberID: subscriberID) }
+            }
+            Task { await hub.subscribe(sessionID, subscriberID: subscriberID, continuation: continuation) }
+        }
+
+        // Deterministic subscribe-before-evict: wait until the hub actually
+        // registered the subscriber, otherwise the eviction could race the
+        // attach and finish the stream at subscribe time for the wrong reason.
+        let attached = await until(timeout: 5) { await hub.subscriberCount(sessionID) == 1 }
+        #expect(attached, "subscriber must be registered before the eviction")
+
+        // Evicting the session must finish the live subscriber's stream, not hang it.
+        await hub.retainOnly([])
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in stream {}
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        #expect(finished, "evicted subscriber's stream must finish, not hang")
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func activeSessionSubscribersSurviveRetentionSweepOfOtherSessions() async throws {
+        let root = tempDir
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = makePaths(root: root)
+        try paths.ensurePrivateDirectoryLayout()
+        let supervisor = ProcessLaunchSupervisor(paths: paths)
+
+        // Long-running session with a coordinator-style live subscriber.
+        let running = try await supervisor.start(
+            plan: makePlan(executable: "/bin/sleep", root: root, arguments: ["30"])
+        )
+        let stream = supervisor.events(sessionID: running.id)
+        try await Task.sleep(nanoseconds: 300_000_000) // let the attach task land
+
+        // A second, short session exits; its retention sweep is bounded by the
+        // recent-sessions window, which never contains still-active sessions —
+        // the sweep must not evict the running session's subscribers (the
+        // coordinator's terminal-event observer hangs forever when it does).
+        let short = try await supervisor.start(plan: makePlan(executable: "/bin/cat", root: root))
+        _ = await collectEvents(supervisor.events(sessionID: short.id))
+
+        try await supervisor.requestTermination(sessionID: running.id)
+        let events = await collectEvents(stream, timeout: 15)
+        #expect(
+            events.last?.kind == .exited || events.last?.kind == .failed,
+            "active session's subscriber lost the terminal event to the retention sweep"
         )
     }
 
