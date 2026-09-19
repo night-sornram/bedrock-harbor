@@ -3,6 +3,7 @@ import Foundation
 import HarborApplication
 import HarborDomain
 import HarborGooglePlay
+import HarborPlatform
 import HarborRuntime
 import SwiftUI
 
@@ -508,11 +509,13 @@ public final class AppState {
                     .appendingPathComponent(gplay.versionName, isDirectory: true)
                 try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
                 if let extractor = findExtractor() {
-                    let process = Process()
-                    process.executableURL = extractor
-                    process.arguments = gplay.files.map(\.path) + [dest.path]
-                    try process.run()
-                    process.waitUntilExit()
+                    // Exit status unchecked on purpose: importIntoHarbor verifies
+                    // libminecraftpe.so below, exactly like the old blocking run.
+                    _ = try await HarborSubprocess.run(
+                        executable: extractor,
+                        arguments: gplay.files.map(\.path) + [dest.path],
+                        timeout: 600
+                    )
                     let install = try await GamePackageAcquirer.importIntoHarbor(from: dest, services: services)
                     try? FileManager.default.removeItem(at: gplay.stagingDir)
                     await reload()
@@ -588,11 +591,13 @@ public final class AppState {
                 let dest = GamePackageAcquirer.harborInstallRoot().appendingPathComponent(versionName, isDirectory: true)
                 try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
                 if let extractor = findExtractor() {
-                    let process = Process()
-                    process.executableURL = extractor
-                    process.arguments = files.map(\.fileURL.path) + [dest.path]
-                    try process.run()
-                    process.waitUntilExit()
+                    // Exit status unchecked on purpose: importIntoHarbor below
+                    // verifies libminecraftpe.so, exactly like before.
+                    _ = try await HarborSubprocess.run(
+                        executable: extractor,
+                        arguments: files.map(\.fileURL.path) + [dest.path],
+                        timeout: 600
+                    )
                 } else {
                     _ = try await GamePackageAcquirer.extractAPK(files[0].fileURL, services: services)
                     await reload()

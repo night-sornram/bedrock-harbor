@@ -1,5 +1,6 @@
 import Foundation
 import HarborDomain
+import HarborPlatform
 
 /// Official minecraft-linux `mcpelauncher-updates` compatibility mod (public moddb).
 ///
@@ -424,13 +425,12 @@ public struct HarborCompatibilityPatches: Sendable {
         try FileManager.default.moveItem(at: downloaded, to: zipURL)
         let extractURL = tmp.appendingPathComponent("extract", isDirectory: true)
         try FileManager.default.createDirectory(at: extractURL, withIntermediateDirectories: true)
-        let ditto = Process()
-        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        ditto.arguments = ["-x", "-k", zipURL.path, extractURL.path]
-        try ditto.run()
-        ditto.waitUntilExit()
-        guard ditto.terminationStatus == 0 else {
-            throw HarborError.providerFailure(reason: "ditto extract failed (\(ditto.terminationStatus))")
+        let ditto = try await HarborSubprocess.run(
+            executable: URL(fileURLWithPath: "/usr/bin/ditto"),
+            arguments: ["-x", "-k", zipURL.path, extractURL.path]
+        )
+        guard ditto.exitCode == 0, !ditto.timedOut else {
+            throw HarborError.providerFailure(reason: "ditto extract failed (\(ditto.exitCode))")
         }
 
         if FileManager.default.fileExists(atPath: installPath.path) {

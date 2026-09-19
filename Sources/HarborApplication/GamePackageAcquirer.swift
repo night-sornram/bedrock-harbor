@@ -133,20 +133,16 @@ public struct GamePackageAcquirer: Sendable {
             throw HarborError.unsupportedRuntime(reason: "mcpelauncher-extract not found in BedrockHarbor/Runtimes")
         }
 
-        let process = Process()
-        process.executableURL = extractor
-        process.arguments = [apk.path, dest.path]
-        process.currentDirectoryURL = dest
-        let err = Pipe()
-        process.standardError = err
-        process.standardOutput = Pipe()
-        try process.run()
-        process.waitUntilExit()
+        let extract = try await HarborSubprocess.run(
+            executable: extractor,
+            arguments: [apk.path, dest.path],
+            currentDirectory: dest
+        )
 
         let lib = dest.appendingPathComponent("lib/arm64-v8a/libminecraftpe.so")
-        guard process.terminationStatus == 0, fm.fileExists(atPath: lib.path) else {
-            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw HarborError.invalidPackage(reason: "APK extract failed (status \(process.terminationStatus)): \(msg)")
+        guard extract.exitCode == 0, !extract.timedOut, fm.fileExists(atPath: lib.path) else {
+            // stderr is capped at the first 64 KB — enough to diagnose, never a firehose.
+            throw HarborError.invalidPackage(reason: "APK extract failed (status \(extract.exitCode)): \(extract.stderr)")
         }
 
         var parts = versionName.split(separator: ".").compactMap { Int64($0) }

@@ -1,5 +1,6 @@
 import Foundation
 import HarborDomain
+import HarborPlatform
 
 /// Installs the mcpelauncher runtime (the "Minecraft Bedrock Launcher" app from
 /// minecraft-linux/macos-builder) into BedrockHarbor/Runtimes so Harbor never asks
@@ -38,13 +39,13 @@ public enum HarborRuntimeInstaller {
         }
         do {
             status?("Finishing Minecraft Bedrock Launcher install…")
-            try deploy(from: dmg)
+            try await deploy(from: dmg)
         } catch {
             // A stale or partially cached DMG is the likely cause — refetch once.
             status?("Retrying launcher install with a fresh download…")
             try? fm.removeItem(at: dmg)
             try await downloadDMG(to: dmg, status: status)
-            try deploy(from: dmg)
+            try await deploy(from: dmg)
         }
     }
 
@@ -100,7 +101,10 @@ public enum HarborRuntimeInstaller {
     // MARK: - Mount + deploy
 
     /// Mount the DMG read-only and deploy the launcher app it contains.
-    public static func deploy(from dmg: URL) throws {
+    /// Async: hdiutil runs through `HarborSubprocess`, and the mount is always
+    /// detached before returning (the old `defer` pattern spelled out as
+    /// do/catch + success-path cleanup, since awaits cannot live in a defer).
+    public static func deploy(from dmg: URL) async throws {
         let fm = FileManager.default
         // Unique mount dir per deploy + guaranteed detach: a leaked mount at a fixed
         // path both breaks the next attach ("mountpoint busy") and lingers as a
@@ -109,28 +113,47 @@ public enum HarborRuntimeInstaller {
             .appendingPathComponent("mnt-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: mountPoint, withIntermediateDirectories: true)
         var mounted = false
-        defer {
-            if mounted {
-                _ = try? runTool("/usr/bin/hdiutil", ["detach", mountPoint.path])
-                _ = try? runTool("/usr/bin/hdiutil", ["detach", "-force", mountPoint.path])
-            }
-            try? fm.removeItem(at: mountPoint)
-        }
         do {
-            try runTool("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly", "-mountpoint", mountPoint.path])
-            mounted = true
+            do {
+                try await runTool("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly", "-mountpoint", mountPoint.path])
+                mounted = true
+            } catch {
+                // Attach failed; hdiutil may still have mounted partially — try once.
+                await detachMount(at: mountPoint)
+                throw error
+            }
+            let contents = mountPoint.appendingPathComponent("Minecraft Bedrock Launcher.app/Contents", isDirectory: true)
+            guard fm.fileExists(atPath: contents.path) else {
+                throw HarborError.invalidPackage(reason: "Minecraft Bedrock Launcher.app missing inside DMG")
+            }
+            let destination = LocalRuntimeDiscovery.harborSupport
+                .appendingPathComponent("Runtimes/\(installDirectoryName)", isDirectory: true)
+            try deploy(appContents: contents, destination: destination)
         } catch {
-            _ = try? runTool("/usr/bin/hdiutil", ["detach", mountPoint.path])
+            // Was the old `defer { if mounted { detach; detach -force } }`.
+            await detachOnExit(of: mountPoint, mounted: mounted)
             try? fm.removeItem(at: mountPoint)
             throw error
         }
-        let contents = mountPoint.appendingPathComponent("Minecraft Bedrock Launcher.app/Contents", isDirectory: true)
-        guard fm.fileExists(atPath: contents.path) else {
-            throw HarborError.invalidPackage(reason: "Minecraft Bedrock Launcher.app missing inside DMG")
+        await detachOnExit(of: mountPoint, mounted: mounted)
+        try? fm.removeItem(at: mountPoint)
+    }
+
+    /// Best-effort unmount used by `deploy` on every exit path (plain detach,
+    /// then a forced one when the volume had mounted successfully).
+    private static func detachOnExit(of mountPoint: URL, mounted: Bool) async {
+        if mounted {
+            await detachMount(at: mountPoint)
+            await detachMount(at: mountPoint, force: true)
         }
-        let destination = LocalRuntimeDiscovery.harborSupport
-            .appendingPathComponent("Runtimes/\(installDirectoryName)", isDirectory: true)
-        try deploy(appContents: contents, destination: destination)
+    }
+
+    /// Fire-and-forget hdiutil detach; failures are ignored like before.
+    private static func detachMount(at mountPoint: URL, force: Bool = false) async {
+        _ = try? await runTool(
+            "/usr/bin/hdiutil",
+            force ? ["detach", "-force", mountPoint.path] : ["detach", mountPoint.path]
+        )
     }
 
     /// Pure file layout step: copy app bundle contents into a runtime root and
@@ -204,24 +227,20 @@ public enum HarborRuntimeInstaller {
         }
     }
 
+    /// Runs a helper tool through the bounded async runner; throws with the
+    /// (capped) stderr on failure. No blocking waits on cooperative threads.
     @discardableResult
-    private static func runTool(_ launchPath: String, _ arguments: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: launchPath)
-        process.arguments = arguments
-        let out = Pipe()
-        let err = Pipe()
-        process.standardOutput = out
-        process.standardError = err
-        try process.run()
-        process.waitUntilExit()
-        let errText = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        guard process.terminationStatus == 0 else {
+    private static func runTool(_ launchPath: String, _ arguments: [String]) async throws -> String {
+        let result = try await HarborSubprocess.run(
+            executable: URL(fileURLWithPath: launchPath),
+            arguments: arguments
+        )
+        guard result.exitCode == 0, !result.timedOut else {
             throw HarborError.unsupportedRuntime(
-                reason: "\(URL(fileURLWithPath: launchPath).lastPathComponent) failed: \(errText)"
+                reason: "\(URL(fileURLWithPath: launchPath).lastPathComponent) failed: \(result.stderr)"
             )
         }
-        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return result.stdout
     }
 
     /// One install at a time per process — startup self-heal and a user-triggered
