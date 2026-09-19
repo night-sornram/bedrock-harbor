@@ -19,10 +19,10 @@ struct ProcessLaunchSupervisorTests {
         )
     }
 
-    private func makePlan(executable: String, root: URL) -> LaunchPlan {
+    private func makePlan(executable: String, root: URL, arguments: [String] = []) -> LaunchPlan {
         LaunchPlan(
             executableURL: URL(fileURLWithPath: executable),
-            arguments: [],
+            arguments: arguments,
             workingDirectoryURL: root,
             environment: ["PATH": "/usr/bin:/bin"],
             gameDataDirectoryURL: root.appendingPathComponent("data", isDirectory: true),
@@ -117,6 +117,48 @@ struct ProcessLaunchSupervisorTests {
         let replay = await collectEvents(supervisor.events(sessionID: session.id), timeout: 5)
         #expect(!replay.isEmpty)
         #expect(replay.last?.kind == .exited || replay.last?.kind == .failed)
+    }
+
+    // MARK: - Multi-subscriber fan-out (coordinator observer + UI listener)
+
+    @Test(.timeLimit(.minutes(1)))
+    func terminalEventFansOutToAllSubscribersOfLiveSession() async throws {
+        let root = tempDir
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = makePaths(root: root)
+        try paths.ensurePrivateDirectoryLayout()
+        let supervisor = ProcessLaunchSupervisor(paths: paths)
+
+        // /bin/sleep keeps the session live long enough for a mid-session
+        // UI-style subscriber to attach next to the coordinator-style one.
+        let plan = makePlan(executable: "/bin/sleep", root: root, arguments: ["30"])
+        let session = try await supervisor.start(plan: plan)
+
+        // Subscriber 1: coordinator-style, attached right after launch.
+        let coordinatorStream = supervisor.events(sessionID: session.id)
+        try await Task.sleep(nanoseconds: 200_000_000) // let the attach task land
+
+        // Subscriber 2: UI-style, attached mid-session while the game runs.
+        let uiStream = supervisor.events(sessionID: session.id)
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        try await supervisor.requestTermination(sessionID: session.id)
+
+        // BOTH subscribers must observe the terminal event: the coordinator's
+        // lease release depends on its stream surviving the UI subscription.
+        let coordinatorEvents = await collectEvents(coordinatorStream, timeout: 15)
+        let uiEvents = await collectEvents(uiStream, timeout: 15)
+
+        #expect(coordinatorEvents.map(\.kind).contains(.running))
+        #expect(
+            coordinatorEvents.last?.kind == .exited || coordinatorEvents.last?.kind == .failed,
+            "coordinator-style subscriber lost the terminal event"
+        )
+        #expect(uiEvents.map(\.kind).contains(.stopping))
+        #expect(
+            uiEvents.last?.kind == .exited || uiEvents.last?.kind == .failed,
+            "UI-style subscriber lost the terminal event"
+        )
     }
 
     // MARK: - Noisy subprocess (regression fixture: large amounts of output)

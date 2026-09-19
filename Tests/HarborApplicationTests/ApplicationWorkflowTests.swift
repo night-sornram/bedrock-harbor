@@ -260,10 +260,26 @@ struct ApplicationWorkflowTests {
         #expect(await coordinator.activeSession() != nil)
         #expect(await services.leases.isHeld(dataRootID: fixture.profile.dataRootID))
 
+        // A UI-style second subscriber attaches mid-session, next to the
+        // coordinator's own observer. It must not break the coordinator's
+        // lease release when the terminal event arrives.
+        let uiSubscriber = Task { () -> [RuntimeEvent] in
+            var received: [RuntimeEvent] = []
+            for await event in launcher.events(sessionID: session.id) {
+                received.append(event)
+            }
+            return received
+        }
+
         // Termination confirmed by the runtime event stream — not by a UI call.
         await launcher.emitTerminal(.exited, sessionID: session.id)
         #expect(await until { await coordinator.activeSession() == nil })
         #expect(!(await services.leases.isHeld(dataRootID: fixture.profile.dataRootID)))
+        let uiEvents = await uiSubscriber.value
+        #expect(
+            uiEvents.last?.kind == .exited || uiEvents.last?.kind == .failed,
+            "UI-style subscriber lost the terminal event"
+        )
 
         // Reservation cleared: a fresh launch goes through and also auto-releases.
         let second = try await coordinator.launch(

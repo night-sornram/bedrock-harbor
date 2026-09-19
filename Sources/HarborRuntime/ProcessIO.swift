@@ -56,14 +56,20 @@ final class ProcessLogWriter: @unchecked Sendable {
         }
     }
 
-    /// Idempotent. Ring contents stay queryable after close.
+    /// Idempotent. Asynchronous so callers on the cooperative pool (the
+    /// supervisor actor's `noteExit`) never block: the serial queue preserves
+    /// ordering, so writes already queued before `close()` still land and
+    /// later writes are dropped exactly as with a synchronous close. Ring
+    /// contents stay queryable after close.
     func close() {
-        queue.sync {
-            guard !closed else { return }
-            closed = true
-            try? handle?.close()
-            handle = nil
-        }
+        queue.async { self.closeOnQueue() }
+    }
+
+    private func closeOnQueue() {
+        guard !closed else { return }
+        closed = true
+        try? handle?.close()
+        handle = nil
     }
 
     // MARK: - Queue-confined internals

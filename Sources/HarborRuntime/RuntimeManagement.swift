@@ -492,10 +492,11 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
 
     public nonisolated func events(sessionID: UUID) -> AsyncStream<RuntimeEvent> {
         AsyncStream { continuation in
+            let subscriberID = UUID()
             continuation.onTermination = { @Sendable _ in
-                Task { await self.hub.unsubscribe(sessionID) }
+                Task { await self.hub.unsubscribe(sessionID, subscriberID: subscriberID) }
             }
-            Task { await self.hub.subscribe(sessionID, continuation: continuation) }
+            Task { await self.hub.subscribe(sessionID, subscriberID: subscriberID, continuation: continuation) }
         }
     }
 
@@ -515,41 +516,68 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
     }
 }
 
-/// Fan-out hub for `RuntimeEvent`s. Keeps a bounded per-session history so a
-/// subscriber attaching after a super-fast exit still sees the full sequence
-/// (`.started`, `.running`, terminal), and finishes the stream for finished or
-/// unknown sessions so `events(sessionID:)` can never hang. One live
-/// subscriber per session: a later subscriber replaces (finishes) the previous.
+/// Fan-out hub for `RuntimeEvent`s. Supports multiple simultaneous
+/// subscribers per session (the coordinator's lease-release observer plus any
+/// UI listeners): every live subscriber receives every event, and a terminal
+/// event is delivered to all of them and finishes every stream. Keeps a
+/// bounded per-session history so a subscriber attaching after a super-fast
+/// exit still sees the full sequence, and finishes streams for finished or
+/// unknown sessions so `events(sessionID:)` can never hang. The FIRST terminal
+/// event is authoritative: later emits for that session are ignored, so a
+/// finished session can never look live again (e.g. under reordered emission).
 actor SessionEventHub {
-    private var continuations: [UUID: AsyncStream<RuntimeEvent>.Continuation] = [:]
+    private struct Subscriber {
+        let id: UUID
+        let continuation: AsyncStream<RuntimeEvent>.Continuation
+    }
+
+    private var subscribers: [UUID: [Subscriber]] = [:]
     private var history: [UUID: [RuntimeEvent]] = [:]
 
-    func subscribe(_ sessionID: UUID, continuation: AsyncStream<RuntimeEvent>.Continuation) {
+    private static func isTerminal(_ event: RuntimeEvent) -> Bool {
+        event.kind == .exited || event.kind == .failed
+    }
+
+    func subscribe(
+        _ sessionID: UUID,
+        subscriberID: UUID,
+        continuation: AsyncStream<RuntimeEvent>.Continuation
+    ) {
         guard let events = history[sessionID] else {
             // Unknown session: nothing to replay, nothing will ever arrive.
             continuation.finish()
             return
         }
         for event in events { continuation.yield(event) }
-        if let last = events.last, last.kind == .exited || last.kind == .failed {
+        // "Contains terminal" (not "last is terminal") — see emit(_:).
+        if events.contains(where: Self.isTerminal) {
             continuation.finish()
             return
         }
-        if let previous = continuations[sessionID] { previous.finish() }
-        continuations[sessionID] = continuation
+        subscribers[sessionID, default: []].append(Subscriber(id: subscriberID, continuation: continuation))
     }
 
-    func unsubscribe(_ sessionID: UUID) {
-        continuations.removeValue(forKey: sessionID)
+    /// Removes exactly one subscriber; other subscribers of the session
+    /// (registered before or after this one) keep receiving events.
+    func unsubscribe(_ sessionID: UUID, subscriberID: UUID) {
+        subscribers[sessionID]?.removeAll { $0.id == subscriberID }
     }
 
     func emit(_ event: RuntimeEvent) {
-        history[event.sessionID, default: []].append(event)
-        guard let continuation = continuations[event.sessionID] else { return }
-        continuation.yield(event)
-        if event.kind == .exited || event.kind == .failed {
-            continuations.removeValue(forKey: event.sessionID)
-            continuation.finish()
+        var events = history[event.sessionID] ?? []
+        guard !events.contains(where: Self.isTerminal) else {
+            return // already finished: the first terminal stays authoritative
+        }
+        events.append(event)
+        history[event.sessionID] = events
+
+        let live = subscribers[event.sessionID] ?? []
+        if Self.isTerminal(event) {
+            subscribers.removeValue(forKey: event.sessionID)
+        }
+        for subscriber in live {
+            subscriber.continuation.yield(event)
+            if Self.isTerminal(event) { subscriber.continuation.finish() }
         }
     }
 
@@ -558,6 +586,7 @@ actor SessionEventHub {
     func retainOnly(_ sessionIDs: Set<UUID>) {
         for id in history.keys where !sessionIDs.contains(id) {
             history.removeValue(forKey: id)
+            subscribers.removeValue(forKey: id)
         }
     }
 }
