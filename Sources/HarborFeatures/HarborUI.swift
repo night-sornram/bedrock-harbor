@@ -747,7 +747,8 @@ public final class AppState {
             return
         }
         try? await coordinator.requestStop()
-        await coordinator.reconcileExited()
+        // No reconcileExited() here: the coordinator releases the lease itself
+        // once the runtime confirms the process exited (terminal RuntimeEvent).
         isGameRunning = false
         status = "Stop requested"
     }

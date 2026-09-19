@@ -177,6 +177,11 @@ public actor GameSessionCoordinator {
 
     private let services: HarborServiceBundle
     private var active: ActiveSession?
+    /// Set as the FIRST statement of `launch()` (before any await) and cleared
+    /// on every exit path. Actors are reentrant, so `active == nil` alone lets
+    /// a concurrent `launch()` interleave at any suspension point below and
+    /// double-enter the launch pipeline; this flag closes that window.
+    private var launchReserved = false
 
     public init(services: HarborServiceBundle) {
         self.services = services
@@ -189,29 +194,72 @@ public actor GameSessionCoordinator {
         installation: InstalledMinecraft,
         runtime: RuntimeInstallation
     ) async throws -> LaunchSession {
-        guard active == nil else { throw HarborError.gameRunning(profileID: profile.id) }
+        guard !launchReserved else { throw HarborError.gameRunning(profileID: profile.id) }
+        launchReserved = true
         guard let launcher = services.runtimeLauncher else {
+            launchReserved = false
             throw HarborError.feasibilityGateIncomplete(reason: "Runtime launcher is not composed")
         }
         let verified = try await Self.verifyInstallation(installation, services: services)
-        guard verified.integrity == .verified else {
-            throw HarborError.invalidPackage(
-                reason: "Game package not verified under \(installation.relativeGameDirectory). Place lib/arm64-v8a/libminecraftpe.so in BedrockHarbor/Installations."
-            )
-        }
         let owner = "session-\(UUID().uuidString)"
-        try await services.leases.acquire(dataRootID: profile.dataRootID, owner: owner)
         do {
+            guard verified.integrity == .verified else {
+                throw HarborError.invalidPackage(
+                    reason: "Game package not verified under \(installation.relativeGameDirectory). Place lib/arm64-v8a/libminecraftpe.so in BedrockHarbor/Installations."
+                )
+            }
+            try await services.leases.acquire(dataRootID: profile.dataRootID, owner: owner)
             _ = try await LaunchGateWorkflow(services: services)
                 .assertLaunchAllowed(profile: profile, installation: verified, runtime: runtime)
             let plan = try await launcher.prepareLaunchPlan(profile: profile, installation: verified, runtime: runtime)
             let session = try await launcher.start(plan: plan)
             active = ActiveSession(session: session, dataRootID: profile.dataRootID, leaseOwner: owner)
+            // Success: the reservation is now owned by the observer below, which
+            // clears it when the runtime CONFIRMS the process ended. Lease
+            // release follows confirmed termination, not UI calls.
+            observeTermination(
+                launcher: launcher,
+                sessionID: session.id,
+                dataRootID: profile.dataRootID,
+                leaseOwner: owner
+            )
             return session
         } catch {
+            // Manual release on every thrown-error path (deliberately no defer:
+            // the success path hands the reservation to the observer instead).
+            launchReserved = false
             await services.leases.release(dataRootID: profile.dataRootID, owner: owner)
             throw error
         }
+    }
+
+    /// Watches the runtime event stream until a terminal event (`.exited` /
+    /// `.failed`), then releases the data-root lease and clears session state.
+    private func observeTermination(
+        launcher: any RuntimeLaunching,
+        sessionID: UUID,
+        dataRootID: String,
+        leaseOwner: String
+    ) {
+        Task {
+            for await event in launcher.events(sessionID: sessionID) {
+                guard event.kind == .exited || event.kind == .failed else { continue }
+                await self.sessionDidEnd(sessionID: sessionID, dataRootID: dataRootID, leaseOwner: leaseOwner)
+                return
+            }
+            // Stream finished without a terminal event (launcher without event
+            // support): cleanup is left to the reconcileExited() fallback.
+        }
+    }
+
+    /// Idempotent cleanup. Only acts while `sessionID` is still the active
+    /// session, so a stale observer (superseded by `reconcileExited()` or by a
+    /// newer launch) can never clobber the new session's state or reservation.
+    private func sessionDidEnd(sessionID: UUID, dataRootID: String, leaseOwner: String) async {
+        guard active?.session.id == sessionID else { return }
+        await services.leases.release(dataRootID: dataRootID, owner: leaseOwner)
+        active = nil
+        launchReserved = false
     }
 
     public static func verifyInstallation(
@@ -247,10 +295,13 @@ public actor GameSessionCoordinator {
         }
     }
 
+    /// Fallback cleanup for launchers without event support. Idempotent and
+    /// safe to call anytime: the primary path is the terminal-event observer
+    /// spawned by `launch()`. Does nothing while a launch is merely in flight
+    /// (no active session yet), so it can never clobber a reservation.
     public func reconcileExited() async {
         guard let current = active else { return }
-        await services.leases.release(dataRootID: current.dataRootID, owner: current.leaseOwner)
-        active = nil
+        await sessionDidEnd(sessionID: current.session.id, dataRootID: current.dataRootID, leaseOwner: current.leaseOwner)
     }
 }
 
@@ -415,7 +466,7 @@ public struct PlaceholderRuntimeLauncher: RuntimeLaunching {
     public func start(plan: LaunchPlan) async throws -> LaunchSession {
         throw HarborError.feasibilityGateIncomplete(reason: "Runtime process launch requires qualification")
     }
-    public func events(sessionID: UUID) -> AsyncStream<LaunchSessionState> {
+    public func events(sessionID: UUID) -> AsyncStream<RuntimeEvent> {
         AsyncStream { $0.finish() }
     }
     public func requestTermination(sessionID: UUID) async throws {}

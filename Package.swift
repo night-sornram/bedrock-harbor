@@ -90,7 +90,7 @@ let package = Package(
         ),
         .testTarget(
             name: "HarborRuntimeTests",
-            dependencies: ["HarborRuntime", "HarborDomain"],
+            dependencies: ["HarborRuntime", "HarborDomain", "HarborPlatform"],
             path: "Tests/HarborRuntimeTests"
         ),
         .testTarget(

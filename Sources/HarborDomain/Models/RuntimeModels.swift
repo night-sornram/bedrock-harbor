@@ -412,6 +412,35 @@ public enum LaunchSessionState: String, Hashable, Sendable, Codable {
     case terminated
 }
 
+/// Runtime lifecycle event streamed to the UI / coordinator.
+/// `message` is short and redaction-safe: never contains env values or URLs.
+public struct RuntimeEvent: Hashable, Sendable, Codable, Identifiable {
+    public enum Kind: String, Codable, Sendable { case started, running, stopping, exited, failed }
+
+    public var id: UUID
+    public var sessionID: UUID
+    public var kind: Kind
+    public var occurredAt: Date
+    public var exitCode: Int32?
+    public var message: String?
+
+    public init(
+        id: UUID = UUID(),
+        sessionID: UUID,
+        kind: Kind,
+        occurredAt: Date = Date(),
+        exitCode: Int32? = nil,
+        message: String? = nil
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.kind = kind
+        self.occurredAt = occurredAt
+        self.exitCode = exitCode
+        self.message = message
+    }
+}
+
 public struct LaunchSession: Hashable, Sendable, Codable, Identifiable {
     public var id: UUID
     public var profileID: UUID

@@ -268,12 +268,24 @@ public struct LocalRuntimeDiscovery: Sendable {
 }
 
 public actor ProcessLaunchSupervisor: RuntimeLaunching {
+    private static let recentSessionLimit = 10
+
     private var layouts: [String: MCLauncherClientLayout] = [:]
     private var active: [UUID: LaunchSession] = [:]
     private var processes: [UUID: Process] = [:]
+    private var writers: [UUID: ProcessLogWriter] = [:]
+    private var stopRequested: Set<UUID> = []
+    private var recentSessions: [LaunchSession] = []
     private let paths: HarborPaths
+    private let timing: LaunchTimingRecorder
+    private let hub = SessionEventHub()
 
-    public init(paths: HarborPaths) { self.paths = paths }
+    public init(paths: HarborPaths) {
+        self.paths = paths
+        // Timing is diagnostics-only and records one in-flight session at a time;
+        // Harbor launches one game session at a time, so this matches reality.
+        self.timing = LaunchTimingRecorder(directory: paths.metadataDirectory)
+    }
 
     public func registerLayout(_ layout: MCLauncherClientLayout) {
         layouts[layout.releaseID] = layout
@@ -378,6 +390,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         try paths.ensurePrivateDirectoryLayout()
         try FileManager.default.createDirectory(at: paths.sessionLogs, withIntermediateDirectories: true)
         let sessionID = UUID()
+        await timing.begin(kind: "launch", runtimeRelease: plan.runtimeReleaseID)
         let logURL = paths.sessionLogs.appendingPathComponent("session-\(sessionID.uuidString).log")
         var session = LaunchSession(
             id: sessionID,
@@ -399,7 +412,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         process.standardError = err
         process.standardInput = FileHandle.nullDevice
         do { try process.run() } catch {
-            session.state = .failed
+            await timing.end(outcome: "failed")
             throw HarborError.unsupportedRuntime(reason: "Process failed to start: \(error.localizedDescription)")
         }
         session.state = .running
@@ -407,48 +420,145 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         session.startedAt = Date()
         active[sessionID] = session
         processes[sessionID] = process
-        Task.detached { await self.drain(out, to: logURL, tag: "stdout") }
-        Task.detached { await self.drain(err, to: logURL, tag: "stderr") }
-        Task.detached {
-            process.waitUntilExit()
-            await self.noteExit(sessionID: sessionID, code: process.terminationStatus, reason: process.terminationReason)
+        await timing.mark(.processLaunched)
+
+        // Nonblocking IO: handlers run on dispatch queues, never on this actor
+        // or the cooperative pool.
+        let writer = ProcessLogWriter(fileURL: logURL)
+        writers[sessionID] = writer
+        ProcessPipeDrainer.drain(out.fileHandleForReading, writer: writer, tag: "stdout")
+        ProcessPipeDrainer.drain(err.fileHandleForReading, writer: writer, tag: "stderr")
+
+        // Termination is observed via the handler (invoked even when set after a
+        // super-fast exit); it hops back here with Sendable values only.
+        // NO waitUntilExit() anywhere — that would block a cooperative thread.
+        process.terminationHandler = { @Sendable exited in
+            let status = exited.terminationStatus
+            let reason = exited.terminationReason
+            Task { await self.noteExit(sessionID: sessionID, code: status, reason: reason) }
         }
+
+        let pid = process.processIdentifier
+        await hub.emit(RuntimeEvent(sessionID: sessionID, kind: .started, message: "pid \(pid)"))
+        await hub.emit(RuntimeEvent(sessionID: sessionID, kind: .running))
         return session
     }
 
-    private func drain(_ pipe: Pipe, to logURL: URL, tag: String) async {
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: logURL.path) { fm.createFile(atPath: logURL.path, contents: nil) }
-        guard let handle = try? FileHandle(forWritingTo: logURL) else { return }
-        defer { try? handle.close() }
-        let read = pipe.fileHandleForReading
-        while true {
-            let chunk = read.availableData
-            if chunk.isEmpty { break }
-            if let data = "[\(tag)] ".data(using: .utf8) {
-                _ = try? handle.seekToEnd()
-                try? handle.write(contentsOf: data)
-                try? handle.write(contentsOf: chunk)
-            }
-        }
-    }
-
-    private func noteExit(sessionID: UUID, code: Int32, reason: Process.TerminationReason) {
+    /// Terminal-state mapping (documented choice per task brief):
+    /// - exit code 0 → `.exited` / `"ok"`
+    /// - nonzero exit → `.failed` / `"failed"`
+    /// - uncaught signal after `requestTermination` (SIGTERM from our `terminate()`)
+    ///   → `.exited` / `"cancelled"`: the exit was requested by the user, not a crash
+    /// - uncaught signal without a requested stop → `.failed` / `"failed"`: the game died
+    private func noteExit(sessionID: UUID, code: Int32, reason: Process.TerminationReason) async {
+        let requestedStop = stopRequested.remove(sessionID) != nil
         if var s = active[sessionID] {
             s.endedAt = Date()
             s.exitCode = code
-            s.state = reason == .uncaughtSignal ? .terminated : (code == 0 ? .exited : .failed)
+            if reason == .uncaughtSignal {
+                s.terminationSignal = code
+                s.state = requestedStop ? .exited : .failed
+            } else {
+                s.state = code == 0 ? .exited : .failed
+            }
+            active[sessionID] = s
+
+            recentSessions.append(s)
+            if recentSessions.count > Self.recentSessionLimit {
+                recentSessions.removeFirst(recentSessions.count - Self.recentSessionLimit)
+            }
+            await hub.retainOnly(Set(recentSessions.map(\.id)))
+
+            await timing.mark(.sessionEnded)
+            await timing.end(outcome: requestedStop ? "cancelled" : (s.state == .exited ? "ok" : "failed"))
+            await hub.emit(
+                RuntimeEvent(
+                    sessionID: sessionID,
+                    kind: s.state == .exited ? .exited : .failed,
+                    exitCode: code,
+                    message: reason == .uncaughtSignal
+                        ? "signal \(code)\(requestedStop ? " (stop requested)" : "")"
+                        : "exit \(code)"
+                )
+            )
         }
+        // Closing here may drop output still buffered in the pipes (≤ pipe
+        // capacity); descendant processes holding the write end would otherwise
+        // keep the fd open forever. `close()` is idempotent either way.
+        writers.removeValue(forKey: sessionID)?.close()
         processes.removeValue(forKey: sessionID)
         active.removeValue(forKey: sessionID)
     }
 
-    public nonisolated func events(sessionID: UUID) -> AsyncStream<LaunchSessionState> {
-        AsyncStream { $0.finish() }
+    public nonisolated func events(sessionID: UUID) -> AsyncStream<RuntimeEvent> {
+        AsyncStream { continuation in
+            continuation.onTermination = { @Sendable _ in
+                Task { await self.hub.unsubscribe(sessionID) }
+            }
+            Task { await self.hub.subscribe(sessionID, continuation: continuation) }
+        }
     }
 
     public func requestTermination(sessionID: UUID) async throws {
-        if let p = processes[sessionID], p.isRunning { p.interrupt() }
+        guard processes[sessionID] != nil, active[sessionID] != nil else { return }
+        // `terminate()` (SIGTERM) is preferred over `interrupt()` (SIGINT): SIGTERM
+        // is the standard polite-shutdown signal and mcpelauncher handles it as a
+        // normal stop. noteExit maps the resulting uncaughtSignal to `.exited`
+        // because the stop originated here.
+        stopRequested.insert(sessionID)
+        if var s = active[sessionID] {
+            s.state = .terminationRequested
+            active[sessionID] = s
+        }
+        await hub.emit(RuntimeEvent(sessionID: sessionID, kind: .stopping, message: "terminate requested"))
+        if let p = processes[sessionID], p.isRunning { p.terminate() }
+    }
+}
+
+/// Fan-out hub for `RuntimeEvent`s. Keeps a bounded per-session history so a
+/// subscriber attaching after a super-fast exit still sees the full sequence
+/// (`.started`, `.running`, terminal), and finishes the stream for finished or
+/// unknown sessions so `events(sessionID:)` can never hang. One live
+/// subscriber per session: a later subscriber replaces (finishes) the previous.
+actor SessionEventHub {
+    private var continuations: [UUID: AsyncStream<RuntimeEvent>.Continuation] = [:]
+    private var history: [UUID: [RuntimeEvent]] = [:]
+
+    func subscribe(_ sessionID: UUID, continuation: AsyncStream<RuntimeEvent>.Continuation) {
+        guard let events = history[sessionID] else {
+            // Unknown session: nothing to replay, nothing will ever arrive.
+            continuation.finish()
+            return
+        }
+        for event in events { continuation.yield(event) }
+        if let last = events.last, last.kind == .exited || last.kind == .failed {
+            continuation.finish()
+            return
+        }
+        if let previous = continuations[sessionID] { previous.finish() }
+        continuations[sessionID] = continuation
+    }
+
+    func unsubscribe(_ sessionID: UUID) {
+        continuations.removeValue(forKey: sessionID)
+    }
+
+    func emit(_ event: RuntimeEvent) {
+        history[event.sessionID, default: []].append(event)
+        guard let continuation = continuations[event.sessionID] else { return }
+        continuation.yield(event)
+        if event.kind == .exited || event.kind == .failed {
+            continuations.removeValue(forKey: event.sessionID)
+            continuation.finish()
+        }
+    }
+
+    /// Drops history for sessions that fell out of the supervisor's
+    /// `recentSessions` window.
+    func retainOnly(_ sessionIDs: Set<UUID>) {
+        for id in history.keys where !sessionIDs.contains(id) {
+            history.removeValue(forKey: id)
+        }
     }
 }
 

@@ -66,7 +66,7 @@ public protocol RuntimeLaunching: Sendable {
         runtime: RuntimeInstallation
     ) async throws -> LaunchPlan
     func start(plan: LaunchPlan) async throws -> LaunchSession
-    func events(sessionID: UUID) -> AsyncStream<LaunchSessionState>
+    func events(sessionID: UUID) -> AsyncStream<RuntimeEvent>
     func requestTermination(sessionID: UUID) async throws
 }
 
