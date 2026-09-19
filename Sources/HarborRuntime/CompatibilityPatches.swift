@@ -609,31 +609,122 @@ public struct HarborCompatibilityPatches: Sendable {
     /// Harbor applies its own compat stack (guest libc hash repair, symbol shim mod,
     /// universal game libraries) and the game must run without the official mod.
     /// Throws `.compatibilityBlocked` when no known-good path exists for the game version.
+    /// Thin wrapper over `prepareForLaunchDetailed` (which see for the receipt fast path).
+    @discardableResult
     public static func prepareForLaunch(
         gameDirectory: URL,
         versionName: String? = nil,
         versionCode: Int64? = nil,
         runtimeRoot: URL? = nil
     ) async throws -> URL? {
+        try await prepareForLaunchDetailed(
+            gameDirectory: gameDirectory,
+            versionName: versionName,
+            versionCode: versionCode,
+            runtimeRoot: runtimeRoot
+        ).modDirectory
+    }
+
+    /// Receipt-aware launch preparation. Repeat launches of an unchanged configuration
+    /// skip all heavy filesystem work: when a stored receipt matches every input
+    /// (version, game/runtime directories, mod patch version, bypass decision) AND the
+    /// current lib/arm64-v8a fingerprints equal the receipt's recorded POST-preparation
+    /// state, the slow path's decision is returned with `reusedReceipt: true` and nothing
+    /// is touched — no library restore/swap, no StorageQueryCompatibilityPatch scan, no
+    /// guest libc repair. Any input or fingerprint drift invalidates naturally and the
+    /// (idempotent) slow path re-runs, afterwards writing a fresh receipt.
+    public static func prepareForLaunchDetailed(
+        gameDirectory: URL,
+        versionName: String? = nil,
+        versionCode: Int64? = nil,
+        runtimeRoot: URL? = nil
+    ) async throws -> PreparationOutcome {
         let modDir = try await ensureInstalled(gameVersionName: versionName)
-        guard let versionName, let meta = loadMetadata() else {
-            restorePatchedGameLibraries(gameDirectory: gameDirectory)
-            _ = StorageQueryCompatibilityPatch.patch(gameDirectory: gameDirectory)
-            return modDir
+        let meta = loadMetadata()
+        let patchVersion = meta?.version ?? "none"
+        // The bypass decision the slow path below makes for exactly these inputs;
+        // a receipt recorded under the other decision never matches.
+        let bypassed = versionName.flatMap { name in
+            meta.map { knownIncompatibility(gameVersionName: name, modVersion: $0.version) != nil }
+        } ?? false
+
+        func receiptMatches(_ receipt: PreparationReceipt) -> Bool {
+            receipt.gameVersionName == (versionName ?? "")
+                && receipt.gameDirectoryPath == gameDirectory.path
+                && receipt.runtimeRootPath == (runtimeRoot?.path ?? "")
+                && receipt.patchVersion == patchVersion
+                && receipt.bypassedOfficialMod == bypassed
+        }
+
+        func recordOutcome(
+            modDirectory: URL?,
+            storageReport: StorageQueryCompatibilityPatch.Report,
+            appliedChanges: [String]
+        ) -> PreparationOutcome {
+            var receipts = PreparationReceiptStore.load(root: LocalRuntimeDiscovery.harborSupport)
+            receipts.removeAll(where: receiptMatches) // supersede the prior receipt for this identity
+            receipts.append(
+                PreparationReceipt(
+                    gameVersionName: versionName ?? "",
+                    gameDirectoryPath: gameDirectory.path,
+                    runtimeRootPath: runtimeRoot?.path ?? "",
+                    patchVersion: patchVersion,
+                    bypassedOfficialMod: bypassed,
+                    gameLibFingerprints: PreparationReceiptStore.fingerprints(gameDirectory: gameDirectory),
+                    storagePatchApplied: storageReport.state == .patched || storageReport.state == .alreadyPatched,
+                    createdAt: Date()
+                )
+            )
+            PreparationReceiptStore.save(receipts, root: LocalRuntimeDiscovery.harborSupport)
+            return PreparationOutcome(
+                modDirectory: modDirectory,
+                reusedReceipt: false,
+                appliedChanges: appliedChanges
+            )
+        }
+
+        // Fast path: recorded post-preparation state still current → skip everything.
+        if let receipt = PreparationReceiptStore
+            .load(root: LocalRuntimeDiscovery.harborSupport)
+            .first(where: receiptMatches),
+            receipt.gameLibFingerprints == PreparationReceiptStore.fingerprints(gameDirectory: gameDirectory) {
+            return PreparationOutcome(
+                modDirectory: bypassed ? nil : modDir,
+                reusedReceipt: true,
+                appliedChanges: []
+            )
+        }
+
+        guard let versionName, let meta else {
+            var applied = restorePatchedGameLibraries(gameDirectory: gameDirectory)
+                .map { "restored \($0)" }
+            let storage = StorageQueryCompatibilityPatch.patch(gameDirectory: gameDirectory)
+            if storage.state == .patched { applied.append("storage-query patched") }
+            return recordOutcome(
+                modDirectory: modDir,
+                storageReport: storage,
+                appliedChanges: applied
+            )
         }
 
         if knownIncompatibility(gameVersionName: versionName, modVersion: meta.version) != nil {
             // Official mod crashes for this game generation (see the rule's reason): bypass it and
             // apply Harbor's stack. Verified with Minecraft 1.26.51.1 on runtime v1.8.4-573.
+            var applied: [String] = []
             if let runtimeRoot {
-                _ = GuestLibcCompatibilityPatch.patch(runtimeRoot: runtimeRoot)
+                let libc = GuestLibcCompatibilityPatch.patch(runtimeRoot: runtimeRoot)
+                if libc.state == .patched { applied.append("guest-libc patched") }
             }
             _ = try? ensureSymbolShimInstalled(gameVersionName: versionName)
-            restorePatchedGameLibraries(gameDirectory: gameDirectory)
-            applyUniversalGameLibraries(modDirectory: modDir, gameDirectory: gameDirectory)
-            applyVersionPinnedRebuilds(modDirectory: modDir, gameDirectory: gameDirectory)
-            _ = StorageQueryCompatibilityPatch.patch(gameDirectory: gameDirectory)
-            return nil
+            applied += restorePatchedGameLibraries(gameDirectory: gameDirectory)
+                .map { "restored \($0)" }
+            applied += applyUniversalGameLibraries(modDirectory: modDir, gameDirectory: gameDirectory)
+                .map { "applied universal \($0)" }
+            applied += applyVersionPinnedRebuilds(modDirectory: modDir, gameDirectory: gameDirectory)
+                .map { "applied \($0)" }
+            let storage = StorageQueryCompatibilityPatch.patch(gameDirectory: gameDirectory)
+            if storage.state == .patched { applied.append("storage-query patched") }
+            return recordOutcome(modDirectory: nil, storageReport: storage, appliedChanges: applied)
         }
 
         if !meta.supportedVersionNames.isEmpty,
@@ -648,8 +739,10 @@ public struct HarborCompatibilityPatches: Sendable {
                 """
             )
         }
-        restorePatchedGameLibraries(gameDirectory: gameDirectory)
-        _ = StorageQueryCompatibilityPatch.patch(gameDirectory: gameDirectory)
-        return modDir
+        var applied = restorePatchedGameLibraries(gameDirectory: gameDirectory)
+            .map { "restored \($0)" }
+        let storage = StorageQueryCompatibilityPatch.patch(gameDirectory: gameDirectory)
+        if storage.state == .patched { applied.append("storage-query patched") }
+        return recordOutcome(modDirectory: modDir, storageReport: storage, appliedChanges: applied)
     }
 }

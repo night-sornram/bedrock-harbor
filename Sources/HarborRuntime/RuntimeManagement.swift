@@ -120,6 +120,15 @@ public struct MCLauncherClientLayout: Sendable, Hashable {
     }
 }
 
+/// One persisted runtime hash-cache record (see
+/// `LocalRuntimeDiscovery.cachedExecutableSHA256`): an executable is only re-hashed
+/// when its size or mtime drifts — hashing the runtime executable reads tens of MB.
+struct RuntimeHashCacheEntry: Codable, Sendable {
+    var size: Int64
+    var mtime: Double
+    var sha256: String
+}
+
 /// Harbor-owned discovery only — no hugonote / third-party launcher paths.
 public struct LocalRuntimeDiscovery: Sendable {
     public init() {}
@@ -131,9 +140,13 @@ public struct LocalRuntimeDiscovery: Sendable {
         public var hasGame: Bool
     }
 
+    /// Test seam: overrides the Harbor support root (nil in production).
+    nonisolated(unsafe) static var harborSupportOverride: URL?
+
     public static var harborSupport: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BedrockHarbor", isDirectory: true)
+        harborSupportOverride
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/BedrockHarbor", isDirectory: true)
     }
 
     /// A runtime root only counts when the sign-in webview can actually start:
@@ -160,7 +173,14 @@ public struct LocalRuntimeDiscovery: Sendable {
             return roots
         }
         for entry in entries where !entry.lastPathComponent.hasPrefix("_") {
-            if isRuntimeRootUsable(entry) { roots.append(entry) }
+            // Correctness gate: every root must pass usability checks at least once
+            // per process; roots validated earlier in the same process skip the
+            // repeated stats. A new or changed root re-validates, and every process
+            // restart starts with an empty validation set.
+            if memory.isValidatedRoot(entry) || isRuntimeRootUsable(entry) {
+                memory.rememberValidatedRoot(entry)
+                roots.append(entry)
+            }
         }
         return roots
     }
@@ -171,17 +191,24 @@ public struct LocalRuntimeDiscovery: Sendable {
 
     public func discoverDefault() -> DiscoveredBundle? {
         let fm = FileManager.default
+        let runtimesDir = Self.harborSupport.appendingPathComponent("Runtimes", isDirectory: true)
+        let listing = (try? fm.contentsOfDirectory(atPath: runtimesDir.path))?.sorted() ?? []
+
+        // In-memory fast path: unchanged Runtimes/ listing in this process → reuse the
+        // previous bundle; only the executable gets a cheap existence stat.
+        if let cached = Self.memory.cachedBundle(runtimesDirectory: runtimesDir, listing: listing),
+           fm.isExecutableFile(atPath: cached.layout.executableURL.path) {
+            Self.memory.recordCacheHit()
+            return cached
+        }
+        Self.memory.recordCacheMiss()
+
         guard let runtimeRoot = Self.harborRuntimeRoots().first else { return nil }
         let executable = runtimeRoot.appendingPathComponent("MacOS/mcpelauncher-client")
         guard fm.isExecutableFile(atPath: executable.path) else { return nil }
 
-        var versionLabel = "v1.8.4-573"
-        if let data = try? Data(contentsOf: runtimeRoot.appendingPathComponent("runtime.json")),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let v = obj["version"] as? String {
-            versionLabel = v
-        }
-        let sha = (try? Hashing.sha256Hex(ofFile: executable)) ?? "unhashed"
+        let versionLabel = Self.versionLabel(runtimeRoot: runtimeRoot)
+        let sha = Self.cachedExecutableSHA256(executable) ?? "unhashed"
         let arch = (try? RuntimeArtifactVerifier().inspectArchitecture(executableURL: executable)) ?? .arm64
 
         var gameDir: URL?
@@ -236,13 +263,58 @@ public struct LocalRuntimeDiscovery: Sendable {
             xdgDataDirs: [runtimeRoot.appendingPathComponent("Resources").path],
             forceOpenGLES: true
         )
-        return DiscoveredBundle(runtimeInstallation: runtime, gameInstallation: game, layout: layout, hasGame: hasGame)
+        let bundle = DiscoveredBundle(runtimeInstallation: runtime, gameInstallation: game, layout: layout, hasGame: hasGame)
+        Self.memory.store(bundle: bundle, runtimesDirectory: runtimesDir, listing: listing)
+        return bundle
+    }
+
+    /// Whether the most recent `discoverDefault()` reused the in-memory bundle cache.
+    /// Test hook; not part of the discovery contract.
+    static var lastDiscoveryCacheHit: Bool {
+        memory.lastCacheHit
+    }
+
+    /// Clears the process-local discovery caches (bundle cache + validated roots).
+    /// Test hook simulating a fresh process; persisted caches (hash cache) remain.
+    static func resetProcessDiscoveryCachesForTesting() {
+        memory.reset()
     }
 
     public static func harborModsPaths(gameVersionName: String) -> [String] {
         let url = harborSupport
             .appendingPathComponent("Patches/\(gameVersionName)/arm64-v8a", isDirectory: true)
         return FileManager.default.fileExists(atPath: url.path) ? [url.path] : []
+    }
+
+    /// Runtime version label from the root's runtime.json ("v1.8.4-573" fallback).
+    static func versionLabel(runtimeRoot: URL) -> String {
+        if let data = try? Data(contentsOf: runtimeRoot.appendingPathComponent("runtime.json")),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let v = obj["version"] as? String {
+            return v
+        }
+        return "v1.8.4-573"
+    }
+
+    /// Launch layout for an explicitly chosen runtime root (parameter honoring in
+    /// `ProcessLaunchSupervisor.prepareLaunchPlan`): mirrors the layout discovery
+    /// builds for its root, with the game directory supplied by the caller.
+    static func layout(
+        runtimeRoot: URL,
+        releaseID: String,
+        gameVersionName: String,
+        gameDirectory: URL
+    ) -> MCLauncherClientLayout {
+        MCLauncherClientLayout(
+            runtimeRootURL: runtimeRoot,
+            executableURL: runtimeRoot.appendingPathComponent("MacOS/mcpelauncher-client"),
+            gameDirectoryURL: gameDirectory,
+            releaseID: releaseID,
+            versionLabel: versionLabel(runtimeRoot: runtimeRoot),
+            modsDirectories: harborModsPaths(gameVersionName: gameVersionName),
+            xdgDataDirs: [runtimeRoot.appendingPathComponent("Resources").path],
+            forceOpenGLES: true
+        )
     }
 
     private func latestGameDirectory(under root: URL) -> URL? {
@@ -265,6 +337,105 @@ public struct LocalRuntimeDiscovery: Sendable {
         for (i, p) in parts.prefix(4).enumerated() { code += p * Int64(pow(1000.0, Double(3 - i))) }
         return code
     }
+
+    // MARK: - Persisted runtime hash cache
+
+    static var runtimeHashCacheURL: URL {
+        harborSupport.appendingPathComponent("Metadata/runtime-hash-cache.json", isDirectory: false)
+    }
+
+    static func cachedExecutableSHA256(_ executable: URL) -> String? {
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: executable.path),
+              let size = (attrs[.size] as? NSNumber)?.int64Value,
+              let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970
+        else { return nil }
+
+        var cache: [String: RuntimeHashCacheEntry] = [:]
+        if let data = try? Data(contentsOf: runtimeHashCacheURL),
+           let decoded = try? JSONDecoder().decode([String: RuntimeHashCacheEntry].self, from: data) {
+            cache = decoded
+        }
+        if let entry = cache[executable.path], entry.size == size, entry.mtime == mtime {
+            return entry.sha256
+        }
+        guard let sha = try? Hashing.sha256Hex(ofFile: executable) else { return nil }
+        // Prune entries for executables that no longer exist, then record this one.
+        cache = cache.filter { fm.fileExists(atPath: $0.key) }
+        cache[executable.path] = RuntimeHashCacheEntry(size: size, mtime: mtime, sha256: sha)
+        if let data = try? JSONEncoder().encode(cache) {
+            let url = runtimeHashCacheURL
+            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
+        }
+        return sha
+    }
+
+    // MARK: - Process-local discovery caches
+
+    /// Lock-guarded process state backing the discovery caches. `discoverDefault()`
+    /// stays synchronous (UI and bootstrap call it from nonisolated code), so the
+    /// shared state cannot live on an actor.
+    private final class DiscoveryMemory: @unchecked Sendable {
+        static let shared = DiscoveryMemory()
+
+        private let lock = NSLock()
+        private var bundle: DiscoveredBundle?
+        private var runtimesDirectory: String = ""
+        private var listing: [String] = []
+        private var validatedRoots: Set<String> = []
+        private var hit = false
+
+        /// Cached bundle when this exact Runtimes/ directory still lists the same
+        /// top-level names as the stored discovery.
+        func cachedBundle(runtimesDirectory dir: URL, listing now: [String]) -> DiscoveredBundle? {
+            lock.lock(); defer { lock.unlock() }
+            guard let bundle, dir.path == runtimesDirectory, listing == now else { return nil }
+            return bundle
+        }
+
+        func store(bundle: DiscoveredBundle, runtimesDirectory dir: URL, listing now: [String]) {
+            lock.lock(); defer { lock.unlock() }
+            self.bundle = bundle
+            self.runtimesDirectory = dir.path
+            self.listing = now
+        }
+
+        func isValidatedRoot(_ root: URL) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            return validatedRoots.contains(root.path)
+        }
+
+        func rememberValidatedRoot(_ root: URL) {
+            lock.lock(); defer { lock.unlock() }
+            validatedRoots.insert(root.path)
+        }
+
+        var lastCacheHit: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return hit
+        }
+
+        func recordCacheHit() {
+            lock.lock(); hit = true; lock.unlock()
+        }
+
+        func recordCacheMiss() {
+            lock.lock(); hit = false; lock.unlock()
+        }
+
+        func reset() {
+            lock.lock()
+            bundle = nil
+            runtimesDirectory = ""
+            listing = []
+            validatedRoots = []
+            hit = false
+            lock.unlock()
+        }
+    }
+
+    private static let memory = DiscoveryMemory.shared
 }
 
 public actor ProcessLaunchSupervisor: RuntimeLaunching {
@@ -296,18 +467,68 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         installation: InstalledMinecraft,
         runtime: RuntimeInstallation
     ) async throws -> LaunchPlan {
-        if let bundle = LocalRuntimeDiscovery().discoverDefault() {
-            registerLayout(bundle.layout)
-            let install = bundle.gameInstallation.integrity == .verified ? bundle.gameInstallation : installation
-            return try await makePlan(profile: profile, installation: install, runtime: bundle.runtimeInstallation, layout: bundle.layout)
-        }
-        if let layout = layouts[runtime.releaseID],
-           FileManager.default.isExecutableFile(atPath: layout.executableURL.path) {
-            return try await makePlan(profile: profile, installation: installation, runtime: runtime, layout: layout)
-        }
-        throw HarborError.unsupportedRuntime(
-            reason: "No Harbor private runtime under Application Support/BedrockHarbor/Runtimes"
+        let fm = FileManager.default
+        let discovery = LocalRuntimeDiscovery().discoverDefault()
+        if let bundle = discovery { registerLayout(bundle.layout) }
+
+        // Honor the caller's installation: the profile-selected game wins whenever its
+        // package is actually on disk and not known-failed. Discovery's newest-game
+        // scan is a fallback only — it used to override the selection silently.
+        let callerGameDir = URL(fileURLWithPath: installation.relativeGameDirectory, isDirectory: true)
+        let callerGameLibOnDisk = fm.fileExists(
+            atPath: callerGameDir.appendingPathComponent("lib/arm64-v8a/libminecraftpe.so").path
         )
+        let game: InstalledMinecraft
+        if installation.integrity != .failed && callerGameLibOnDisk {
+            game = installation
+        } else if let bundle = discovery, bundle.gameInstallation.integrity == .verified {
+            game = bundle.gameInstallation
+        } else {
+            game = installation
+        }
+
+        // Honor the caller's runtime: its root wins when it passes the cheap usability
+        // checks; discovery's first root is a fallback only.
+        let callerRuntimeRoot = URL(fileURLWithPath: runtime.relativeInstallPath, isDirectory: true)
+        let useCallerRuntime = LocalRuntimeDiscovery.isRuntimeRootUsable(callerRuntimeRoot)
+
+        let chosenRuntime: RuntimeInstallation
+        let baseLayout: MCLauncherClientLayout
+        if useCallerRuntime,
+           let bundle = discovery,
+           bundle.layout.runtimeRootURL.standardizedFileURL == callerRuntimeRoot.standardizedFileURL {
+            chosenRuntime = runtime
+            baseLayout = bundle.layout
+        } else if useCallerRuntime {
+            chosenRuntime = runtime
+            let built = layouts[runtime.releaseID]
+                ?? LocalRuntimeDiscovery.layout(
+                    runtimeRoot: callerRuntimeRoot,
+                    releaseID: runtime.releaseID,
+                    gameVersionName: game.originalVersionName,
+                    gameDirectory: callerGameDir
+                )
+            registerLayout(built)
+            baseLayout = built
+        } else if let bundle = discovery {
+            chosenRuntime = bundle.runtimeInstallation
+            baseLayout = bundle.layout
+        } else if let layout = layouts[runtime.releaseID],
+                  fm.isExecutableFile(atPath: layout.executableURL.path) {
+            chosenRuntime = runtime
+            baseLayout = layout
+        } else {
+            throw HarborError.unsupportedRuntime(
+                reason: "No Harbor private runtime under Application Support/BedrockHarbor/Runtimes"
+            )
+        }
+
+        // The plan's -dg (game directory) must follow the honored game, not whichever
+        // game directory discovery happened to find.
+        var layout = baseLayout
+        layout.gameDirectoryURL = URL(fileURLWithPath: game.relativeGameDirectory, isDirectory: true)
+
+        return try await makePlan(profile: profile, installation: game, runtime: chosenRuntime, layout: layout)
     }
 
     private func makePlan(
@@ -335,17 +556,19 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         environment["BH_SESSION_RUNTIME"] = runtime.releaseID
 
         // Official mcpelauncher-updates compatibility mod (same public moddb as other launchers).
-        // For game generations where that mod is verified broken, prepareForLaunch applies
+        // For game generations where that mod is verified broken, preparation applies
         // Harbor's compat stack instead and returns nil (no mod directory on `-m`).
+        // Repeat launches of an unchanged configuration skip the heavy work via the
+        // preparation receipt (prepareForLaunchDetailed).
         var compatibilityPatchURL: URL?
         let gameURL = URL(fileURLWithPath: installation.relativeGameDirectory, isDirectory: true)
         do {
-            compatibilityPatchURL = try await HarborCompatibilityPatches.prepareForLaunch(
+            compatibilityPatchURL = try await HarborCompatibilityPatches.prepareForLaunchDetailed(
                 gameDirectory: gameURL,
                 versionName: installation.originalVersionName,
                 versionCode: installation.buildID.versionCode,
                 runtimeRoot: layout.runtimeRootURL
-            )
+            ).modDirectory
         } catch let error as HarborError {
             // A game version positively known to be unrunnable must not launch; patch-fetch
             // failures degrade to launching without the mod.
