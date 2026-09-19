@@ -67,6 +67,127 @@ struct AppStateInstallGateTests {
         #expect(!app.hasVerifiedGame, "game files deleted on disk — install step must come back")
     }
 
+    /// A profile's selectedInstallationID / pinnedRuntimeReleaseID must drive the
+    /// snapshot's gameInstallation / runtime picks — not just "first verified".
+    @Test func gameInstallationAndRuntimeHonorProfileSelection() async throws {
+        let services = try makeServices()
+        let fm = FileManager.default
+
+        func makeInstall(_ version: String) throws -> InstalledMinecraft {
+            let gameDir = fm.temporaryDirectory
+                .appendingPathComponent("bh-game-\(UUID().uuidString)", isDirectory: true)
+            let lib = gameDir.appendingPathComponent("lib/arm64-v8a/libminecraftpe.so")
+            try fm.createDirectory(at: lib.deletingLastPathComponent(), withIntermediateDirectories: true)
+            fm.createFile(atPath: lib.path, contents: Data([0x1]))
+            return InstalledMinecraft(
+                buildID: MinecraftBuildID(
+                    packageIdentifier: "com.mojang.minecraftpe",
+                    versionCode: 1,
+                    abi: .arm64v8a
+                ),
+                originalVersionName: version,
+                relativeGameDirectory: gameDir.path,
+                integrity: .verified,
+                providerID: ProviderID(rawValue: "harbor-install"),
+                packageReceipts: [lib.path]
+            )
+        }
+
+        // "Newer" first in the array so first-verified fallback would pick it.
+        let newer = try makeInstall("1.26.51.1")
+        let older = try makeInstall("1.20.1.01")
+        try await services.metadata.saveInstallations([newer, older])
+
+        let runtimes = [
+            RuntimeInstallation(releaseID: "rel-new", relativeInstallPath: "/r/new", artifactSHA256: "a"),
+            RuntimeInstallation(releaseID: "rel-old", relativeInstallPath: "/r/old", artifactSHA256: "b"),
+        ]
+        try await services.metadata.saveRuntimeInstallations(runtimes)
+
+        let profile = Profile(name: "Default", selectedInstallationID: older.id, pinnedRuntimeReleaseID: "rel-old")
+        try await services.metadata.saveProfiles([profile])
+
+        let app = AppState(services: services)
+        await app.reload()
+        #expect(app.selectedProfileID == profile.id)
+        #expect(app.gameInstallation?.originalVersionName == "1.20.1.01",
+                "profile selects the older install — gameInstallation must honor it")
+        #expect(app.runtime?.releaseID == "rel-old",
+                "profile pins the older runtime — runtime must honor it")
+    }
+
+    /// hasVerifiedGame is a stored snapshot refreshed by reload(), not a live
+    /// stat per read: deleting the receipt after reload must not change the
+    /// stored value until the next reload observes it.
+    @Test func hasVerifiedGameIsStoredSnapshotNotLiveStat() async throws {
+        let services = try makeServices()
+        let fm = FileManager.default
+        let gameDir = fm.temporaryDirectory
+            .appendingPathComponent("bh-game-\(UUID().uuidString)", isDirectory: true)
+        let lib = gameDir.appendingPathComponent("lib/arm64-v8a/libminecraftpe.so")
+        let install = InstalledMinecraft(
+            buildID: MinecraftBuildID(
+                packageIdentifier: "com.mojang.minecraftpe",
+                versionCode: 1,
+                abi: .arm64v8a
+            ),
+            originalVersionName: "1.26.51.1",
+            relativeGameDirectory: gameDir.path,
+            integrity: .verified,
+            providerID: ProviderID(rawValue: "harbor-install"),
+            packageReceipts: [lib.path]
+        )
+        try await services.metadata.saveInstallations([install])
+
+        // Phase 1: receipt missing → stored value false after reload.
+        let app = AppState(services: services)
+        await app.reload()
+        #expect(!app.hasVerifiedGame, "receipt file missing — must read as not installed")
+
+        // Phase 2: receipt appears → true after reload; deleting it afterwards
+        // must NOT change the stored value until the next reload.
+        try fm.createDirectory(at: lib.deletingLastPathComponent(), withIntermediateDirectories: true)
+        fm.createFile(atPath: lib.path, contents: Data([0x1]))
+        await app.reload()
+        #expect(app.hasVerifiedGame)
+
+        try fm.removeItem(at: gameDir)
+        #expect(app.hasVerifiedGame, "snapshot: no re-stat between reads — value changes only on reload")
+
+        await app.reload()
+        #expect(!app.hasVerifiedGame, "next reload observes the missing receipt")
+    }
+
+    /// Startup bootstrap must not scan Downloads: a package sitting in
+    /// (a temp) Downloads is invisible to `acquire(scope: .startup)` with empty
+    /// metadata, while the explicit full scan (Rescan packages) imports it.
+    @Test func startupScopeSkipsDownloadsFullScopeImports() async throws {
+        let services = try makeServices()
+        let fm = FileManager.default
+        let home = fm.temporaryDirectory
+            .appendingPathComponent("bh-home-\(UUID().uuidString)", isDirectory: true)
+        let downloads = home.appendingPathComponent("Downloads/1.26.51.1", isDirectory: true)
+        let lib = downloads.appendingPathComponent("lib/arm64-v8a/libminecraftpe.so")
+        try fm.createDirectory(at: lib.deletingLastPathComponent(), withIntermediateDirectories: true)
+        fm.createFile(atPath: lib.path, contents: Data([0x1]))
+
+        // Startup scope: empty metadata → Harbor Installations root (empty) only.
+        let startup = await GamePackageAcquirer.acquire(services: services, scope: .startup, home: home)
+        #expect(startup.installation == nil, "startup scope must not discover the Downloads package")
+        #expect(!startup.didImport)
+        #expect(try await services.metadata.loadInstallations().isEmpty,
+                "startup scope must not import anything")
+
+        // Full scope: Downloads is scanned and the package is imported.
+        let full = await GamePackageAcquirer.acquire(services: services, scope: .full, home: home)
+        #expect(full.installation?.originalVersionName == "1.26.51.1")
+        #expect(full.didImport)
+        let recorded = try await services.metadata.loadInstallations()
+        #expect(recorded.contains { $0.originalVersionName == "1.26.51.1" })
+        #expect(recorded.allSatisfy { $0.relativeGameDirectory.hasPrefix(home.path) },
+                "import must land inside the (temp) Harbor Installations root")
+    }
+
     /// The startup bootstrap finishes after the UI's first reload (it may download
     /// the runtime for ~40 s). When it completes, the UI must re-read metadata —
     /// otherwise the Home screen randomly stays on the "Install" step.

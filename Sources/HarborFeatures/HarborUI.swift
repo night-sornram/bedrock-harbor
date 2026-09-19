@@ -111,6 +111,16 @@ public final class AppState {
     public var needsOnboarding = true
     public var doctorLines: [String] = []
 
+    // Derived snapshot: these used to be computed properties that hit the
+    // filesystem, the Keychain/token bridge, and UserDefaults on every SwiftUI
+    // render. They are now stored values refreshed by `refreshDerivedState()`
+    // from `reload()` and after every mutating action — views only ever read
+    // the stored fields.
+    public var gameInstallation: InstalledMinecraft?
+    public var runtime: RuntimeInstallation?
+    public var hasVerifiedGame = false
+    public var isPlaySignedIn = false
+
     public let services: HarborServiceBundle
     private var sessionCoordinator: GameSessionCoordinator?
     private let bootstrapBox = ObserverBox()
@@ -142,25 +152,51 @@ public final class AppState {
             ?? profiles.first
     }
 
-    public var gameInstallation: InstalledMinecraft? {
-        installations.first { $0.integrity == .verified }
-            ?? installations.first
+    /// Recomputes the derived snapshot (gameInstallation, runtime,
+    /// hasVerifiedGame, isPlaySignedIn) from the freshly loaded arrays and the
+    /// credential stores. Runs inside `reload()` and after mutating actions —
+    /// never from a SwiftUI `body`.
+    func refreshDerivedState() {
+        let profile = selectedProfile
+
+        // gameInstallation honors the profile: its selected install first,
+        // then first verified, then first.
+        if let wanted = profile?.selectedInstallationID,
+           let match = installations.first(where: { $0.id == wanted }) {
+            gameInstallation = match
+        } else {
+            gameInstallation = installations.first { $0.integrity == .verified }
+                ?? installations.first
+        }
+
+        // runtime honors the profile: its pinned release first, then first.
+        if let pinned = profile?.pinnedRuntimeReleaseID,
+           let match = runtimes.first(where: { $0.releaseID == pinned }) {
+            runtime = match
+        } else {
+            runtime = runtimes.first
+        }
+
+        // Disk-verified on purpose: the first metadata read races the startup
+        // bootstrap (and a lost concurrent write can drop the record), and
+        // trusting metadata alone randomly leaves the UI on the "Install
+        // Minecraft" step for an installed game.
+        if let install = gameInstallation, install.integrity == .verified {
+            let receipt = install.packageReceipts.first
+                ?? URL(fileURLWithPath: install.relativeGameDirectory, isDirectory: true)
+                    .appendingPathComponent("lib/arm64-v8a/libminecraftpe.so").path
+            hasVerifiedGame = FileManager.default.fileExists(atPath: receipt)
+        } else {
+            hasVerifiedGame = false
+        }
+
+        isPlaySignedIn = computePlaySignedIn()
     }
 
-    public var runtime: RuntimeInstallation? { runtimes.first }
-
-    /// Disk-verified on purpose: the first metadata read races the startup bootstrap
-    /// (and a lost concurrent write can drop the record), and trusting metadata alone
-    /// randomly leaves the UI on the "Install Minecraft" step for an installed game.
-    public var hasVerifiedGame: Bool {
-        guard let install = gameInstallation, install.integrity == .verified else { return false }
-        let receipt = install.packageReceipts.first
-            ?? URL(fileURLWithPath: install.relativeGameDirectory, isDirectory: true)
-                .appendingPathComponent("lib/arm64-v8a/libminecraftpe.so").path
-        return FileManager.default.fileExists(atPath: receipt)
-    }
-
-    public var isPlaySignedIn: Bool {
+    /// Credential snapshot behind `isPlaySignedIn`. Same semantics as the old
+    /// per-render computed property (including the wipe-surviving backup),
+    /// computed once per reload/action instead of per SwiftUI render.
+    private func computePlaySignedIn() -> Bool {
         if HarborPlayTokenBridge.loadOAuthToken() != nil { return true }
         if PlaySessionStore.load().cookies["oauth_token"] != nil { return true }
         // Wipe-surviving credential backup (see PlayCredentialBackup) — after a
@@ -201,6 +237,7 @@ public final class AppState {
             playAccountLabel = ready.accountLabel
         }
         if selectedProfileID == nil { selectedProfileID = profiles.first?.id }
+        refreshDerivedState()
         refreshGate()
         status = status.isEmpty ? readySummary() : status
     }
@@ -243,6 +280,7 @@ public final class AppState {
         usedLocalAPK = true
         needsOnboarding = false
         status = "Local package mode — Install from APK / folder… or Rescan packages"
+        refreshDerivedState()
         refreshGate()
     }
 

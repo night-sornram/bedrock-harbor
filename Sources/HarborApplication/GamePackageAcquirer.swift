@@ -12,20 +12,30 @@ public struct GamePackageAcquirer: Sendable {
         public var didImport: Bool
     }
 
+    /// How much of the disk `acquire` is allowed to look at.
+    /// - `startup`: app bootstrap — Harbor-owned Installations root only, never a
+    ///   recursive walk of ~/Downloads or ~/Desktop (slow on real desktops).
+    /// - `full`: explicit user action (Rescan packages) — all roots, recursive.
+    public enum ScanScope {
+        case startup
+        case full
+    }
+
     public init() {}
 
-    public static func harborInstallRoot() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BedrockHarbor/Installations", isDirectory: true)
+    public static func harborInstallRoot(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        home.appendingPathComponent("Library/Application Support/BedrockHarbor/Installations", isDirectory: true)
     }
 
     /// Roots scanned automatically (Harbor-owned first, then common local leftovers).
-    public static func scanRoots() -> [URL] {
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser
+    public static func scanRoots(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
         let support = home.appendingPathComponent("Library/Application Support", isDirectory: true)
         return [
-            harborInstallRoot(),
+            harborInstallRoot(home: home),
             support.appendingPathComponent("Minecraft Bedrock Launcher/game-versions", isDirectory: true),
             support.appendingPathComponent("mcpelauncher/versions", isDirectory: true),
             home.appendingPathComponent("Downloads", isDirectory: true),
@@ -33,10 +43,10 @@ public struct GamePackageAcquirer: Sendable {
         ]
     }
 
-    public static func findGamePackages(limit: Int = 8) -> [URL] {
+    public static func findGamePackages(roots: [URL], limit: Int = 8) -> [URL] {
         let fm = FileManager.default
         var found: [URL] = []
-        for root in scanRoots() {
+        for root in roots {
             guard let enumerator = fm.enumerator(
                 at: root,
                 includingPropertiesForKeys: [.isDirectoryKey],
@@ -60,17 +70,40 @@ public struct GamePackageAcquirer: Sendable {
         return found
     }
 
+    /// Startup-shaped scan: non-recursive listing of the version directories in
+    /// Harbor's own Installations root, each checked for the arm64 game library.
+    /// Never descends into Desktop/Downloads/other-launcher directories.
+    public static func findStartupGamePackages(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        let fm = FileManager.default
+        let root = harborInstallRoot(home: home)
+        guard let entries = try? fm.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return entries
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            .filter { fm.fileExists(atPath: $0.appendingPathComponent("lib/arm64-v8a/libminecraftpe.so").path) }
+    }
+
     /// Copy a discovered package into Harbor Installations and return a verified record.
-    public static func importIntoHarbor(from source: URL, services: HarborServiceBundle) async throws -> InstalledMinecraft {
+    public static func importIntoHarbor(
+        from source: URL,
+        services: HarborServiceBundle,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) async throws -> InstalledMinecraft {
         let fm = FileManager.default
         let lib = source.appendingPathComponent("lib/arm64-v8a/libminecraftpe.so")
         guard fm.fileExists(atPath: lib.path) else {
             throw HarborError.invalidPackage(reason: "Not a Bedrock package: \(source.path)")
         }
         let versionName = source.lastPathComponent
-        let dest = harborInstallRoot().appendingPathComponent(versionName, isDirectory: true)
-        try fm.createDirectory(at: harborInstallRoot(), withIntermediateDirectories: true)
-        if !source.standardizedFileURL.path.hasPrefix(harborInstallRoot().path) {
+        let installRoot = harborInstallRoot(home: home)
+        let dest = installRoot.appendingPathComponent(versionName, isDirectory: true)
+        try fm.createDirectory(at: installRoot, withIntermediateDirectories: true)
+        if !source.standardizedFileURL.path.hasPrefix(installRoot.path) {
             if fm.fileExists(atPath: dest.path) {
                 try fm.removeItem(at: dest)
             }
@@ -176,7 +209,13 @@ public struct GamePackageAcquirer: Sendable {
     }
 
     /// Main entry: make Launch possible without manual file operations.
-    public static func acquire(services: HarborServiceBundle) async -> Result {
+    /// `scope` limits the disk scan: `.startup` (bootstrap) never walks
+    /// ~/Downloads or ~/Desktop; `.full` is reserved for explicit user intent.
+    public static func acquire(
+        services: HarborServiceBundle,
+        scope: ScanScope = .full,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) async -> Result {
         let existing = (try? await services.metadata.loadInstallations()) ?? []
         if let verified = existing.first(where: { $0.integrity == .verified }),
            FileManager.default.fileExists(
@@ -186,10 +225,16 @@ public struct GamePackageAcquirer: Sendable {
             return Result(installation: verified, message: "Using verified package \(verified.originalVersionName)", didImport: false)
         }
 
-        let candidates = findGamePackages()
+        let candidates: [URL]
+        switch scope {
+        case .startup:
+            candidates = findStartupGamePackages(home: home)
+        case .full:
+            candidates = findGamePackages(roots: scanRoots(home: home))
+        }
         for gameDir in candidates {
             do {
-                let install = try await importIntoHarbor(from: gameDir, services: services)
+                let install = try await importIntoHarbor(from: gameDir, services: services, home: home)
                 return Result(
                     installation: install,
                     message: "Auto-imported \(install.originalVersionName) into BedrockHarbor/Installations",

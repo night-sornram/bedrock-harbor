@@ -86,7 +86,10 @@ public enum LocalLaunchBootstrap {
         }
 
         // Auto-acquire game package into Harbor Installations (no manual user step).
-        let acquire = await GamePackageAcquirer.acquire(services: services)
+        // Startup scope: Harbor-owned Installations root only — bootstrap must not
+        // recursively enumerate ~/Downloads or ~/Desktop (slow on real desktops).
+        // The full scan (all roots) runs behind the explicit "Rescan packages" action.
+        let acquire = await GamePackageAcquirer.acquire(services: services, scope: .startup)
         await timing?.mark(.packageAcquisition)
         if let install = acquire.installation {
             var profs = (try? await services.metadata.loadProfiles()) ?? []
