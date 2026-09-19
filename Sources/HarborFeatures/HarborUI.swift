@@ -186,6 +186,11 @@ public final class AppState {
     public var needsOnboarding = true
     public var doctorFindings: [DoctorFinding] = []
 
+    // Worlds ("maps") of the selected profile. Refreshed on section entry and
+    // after import/export — never per render.
+    public internal(set) var worlds: [MinecraftWorld] = []
+    public var hasProfileForWorlds: Bool { selectedProfile != nil }
+
     // Installation snapshots are refreshed outside SwiftUI rendering. Google
     // status comes exclusively from the shared session coordinator.
     public var gameInstallation: InstalledMinecraft?
@@ -207,6 +212,7 @@ public final class AppState {
     public let accountOperations = OperationTracker()
     public let maintenanceOperations = OperationTracker()
     public let diagnosticsOperations = OperationTracker()
+    public let worldsOperations = OperationTracker()
 
     /// Live launch stages, driven by the supervisor's RuntimeEvent stream.
     public let launchProgress = LaunchProgressTracker()
@@ -703,6 +709,82 @@ public final class AppState {
         }
     }
 
+    // MARK: Worlds (maps)
+
+    /// World files are LevelDB — locked while the game runs. One guard for
+    /// both directions of transfer, checked before any panel or copy work.
+    private var worldTransferBlocked: Bool {
+        isGameRunning || launchInFlight
+    }
+
+    public func loadWorlds() async {
+        guard let profile = selectedProfile else {
+            worlds = []
+            return
+        }
+        worlds = await WorldArchiveService.listWorlds(
+            profileDataURL: services.paths.profileDataURL(dataRootID: profile.dataRootID)
+        )
+    }
+
+    public func exportWorld(_ world: MinecraftWorld) {
+        guard !worldTransferBlocked else {
+            worldsOperations.fail("Close Minecraft first — world files are locked while the game runs.")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = WorldArchiveService.sanitizedFileName(for: world)
+        panel.message = "Export “\(world.name)” as a .mcworld world file"
+        panel.prompt = "Export"
+        guard panel.runModal() == .OK, let url = panel.url else {
+            worldsOperations.reset()
+            return
+        }
+        worldsOperations.begin("Packing “\(world.name)”…")
+        Task {
+            do {
+                try await WorldArchiveService.exportWorld(world, to: url)
+                worldsOperations.succeed("Exported \(url.lastPathComponent)")
+            } catch {
+                worldsOperations.fail("Export failed: \(OperationTracker.shortMessage(for: error))")
+            }
+        }
+    }
+
+    public func importWorldFromPanel() {
+        guard !worldTransferBlocked else {
+            worldsOperations.fail("Close Minecraft first — world files are locked while the game runs.")
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Select a .mcworld / .zip world file, or an extracted world folder"
+        panel.prompt = "Import"
+        guard panel.runModal() == .OK, let url = panel.url else {
+            worldsOperations.reset()
+            return
+        }
+        worldsOperations.begin("Importing \(url.lastPathComponent)…")
+        Task {
+            do {
+                guard let profile = selectedProfile else {
+                    throw HarborError.internalInconsistency(reason: "No profile to import into")
+                }
+                let imported = try await WorldArchiveService.importWorld(
+                    from: url,
+                    profileDataURL: services.paths.profileDataURL(dataRootID: profile.dataRootID)
+                )
+                await loadWorlds()
+                worldsOperations.succeed("Imported “\(imported.name)”")
+            } catch {
+                worldsOperations.fail("Import failed: \(OperationTracker.shortMessage(for: error))")
+            }
+        }
+    }
+
     /// Makes the profile's selected installation the one Play launches.
     public func selectInstallation(_ installation: InstalledMinecraft) async {
         guard var profile = selectedProfile,
@@ -1026,6 +1108,7 @@ public final class AppState {
 public final class HarborRootModel {
     public enum Item: String, CaseIterable, Identifiable, Hashable {
         case play = "Play"
+        case worlds = "Worlds"
         case installations = "Installations"
         case accounts = "Accounts"
         case diagnostics = "Diagnostics"
@@ -1034,6 +1117,7 @@ public final class HarborRootModel {
         public var icon: String {
             switch self {
             case .play: return "play.circle"
+            case .worlds: return "map"
             case .installations: return "square.and.arrow.down"
             case .accounts: return "person.crop.circle"
             case .diagnostics: return "stethoscope"
@@ -1126,6 +1210,8 @@ public struct HarborRootView: View {
             switch model.selection {
             case .play:
                 PlayView(app: app, onRecovery: model.handle)
+            case .worlds:
+                WorldsView(app: app, onRecovery: model.handle)
             case .installations:
                 InstallationsView(app: app, onRecovery: model.handle)
             case .accounts:
