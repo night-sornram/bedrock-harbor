@@ -683,11 +683,18 @@ public struct HarborCompatibilityPatches: Sendable {
             )
         }
 
-        // Fast path: recorded post-preparation state still current → skip everything.
+        // Fast path: recorded post-preparation state still current → skip everything,
+        // with one exception: the symbol shim lives under Patches/<gameVersion>/,
+        // outside the receipt's identity and fingerprints, and its absence (e.g. a
+        // Patches/ wipe) must not leave a bypassed launch with no -m mod at all.
+        // ensureSymbolShimInstalled self-checks with a single stat when already present.
         if let receipt = PreparationReceiptStore
             .load(root: LocalRuntimeDiscovery.harborSupport)
             .first(where: receiptMatches),
             receipt.gameLibFingerprints == PreparationReceiptStore.fingerprints(gameDirectory: gameDirectory) {
+            if bypassed, let versionName {
+                _ = try? ensureSymbolShimInstalled(gameVersionName: versionName)
+            }
             return PreparationOutcome(
                 modDirectory: bypassed ? nil : modDir,
                 reusedReceipt: true,

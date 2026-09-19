@@ -295,4 +295,45 @@ final class PreparationReceiptsTests: XCTestCase {
         XCTAssertEqual(try mtime(maesdk), maesdkStamp)
         XCTAssertEqual(try mtime(playFab), playFabStamp)
     }
+
+    func testBypassReceiptReinstallsMissingSymbolShim() async throws {
+        try writeInstalledPatch()
+        let game = try makeGameDir()
+        let maesdk = game.appendingPathComponent("lib/arm64-v8a/libmaesdk.so", isDirectory: false)
+        let shim = LocalRuntimeDiscovery.harborSupport
+            .appendingPathComponent("Patches/1.26.51.1/arm64-v8a/libharbor_symbol_shim.so", isDirectory: false)
+
+        // Slow path installs the symbol shim under Patches/<gameVersion>/arm64-v8a.
+        _ = try await HarborCompatibilityPatches.prepareForLaunchDetailed(
+            gameDirectory: game, versionName: "1.26.51.1", versionCode: nil, runtimeRoot: nil
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: shim.path), "slow path must install the symbol shim")
+
+        // Receipt reuse with the shim still present.
+        let reused = try await HarborCompatibilityPatches.prepareForLaunchDetailed(
+            gameDirectory: game, versionName: "1.26.51.1", versionCode: nil, runtimeRoot: nil
+        )
+        XCTAssertTrue(reused.reusedReceipt)
+
+        // The Patches/ wipe the layout code anticipates: the shim disappears while the
+        // game dir, metadata, and receipt stay valid. The fast path must still reinstall
+        // the shim — otherwise the bypassed game launches with no -m mod at all, the
+        // exact startup crash the shim prevents.
+        try FileManager.default.removeItem(at: shim)
+        let maesdkStamp = try mtime(maesdk)
+
+        let afterWipe = try await HarborCompatibilityPatches.prepareForLaunchDetailed(
+            gameDirectory: game, versionName: "1.26.51.1", versionCode: nil, runtimeRoot: nil
+        )
+        XCTAssertTrue(afterWipe.reusedReceipt, "game-dir state is unchanged; the receipt still applies")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: shim.path),
+            "a bypass receipt hit must reinstall a missing symbol shim before returning"
+        )
+        XCTAssertFalse(
+            LocalRuntimeDiscovery.harborModsPaths(gameVersionName: "1.26.51.1").isEmpty,
+            "the reinstalled shim must be visible to the -m mod paths again"
+        )
+        XCTAssertEqual(try mtime(maesdk), maesdkStamp, "game libs stay untouched (no slow-path re-run)")
+    }
 }

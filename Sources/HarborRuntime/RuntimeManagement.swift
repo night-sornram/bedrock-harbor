@@ -501,15 +501,24 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
             baseLayout = bundle.layout
         } else if useCallerRuntime {
             chosenRuntime = runtime
-            let built = layouts[runtime.releaseID]
-                ?? LocalRuntimeDiscovery.layout(
+            // A registered layout for this releaseID may be discovery's for a
+            // same-named release at a DIFFERENT root (releaseID carries no path), so
+            // reuse it only when it really is the caller's root and its executable is
+            // still there; otherwise build fresh from the caller's root.
+            if let registered = layouts[runtime.releaseID],
+               registered.runtimeRootURL.standardizedFileURL == callerRuntimeRoot.standardizedFileURL,
+               fm.isExecutableFile(atPath: registered.executableURL.path) {
+                baseLayout = registered
+            } else {
+                let built = LocalRuntimeDiscovery.layout(
                     runtimeRoot: callerRuntimeRoot,
                     releaseID: runtime.releaseID,
                     gameVersionName: game.originalVersionName,
                     gameDirectory: callerGameDir
                 )
-            registerLayout(built)
-            baseLayout = built
+                registerLayout(built)
+                baseLayout = built
+            }
         } else if let bundle = discovery {
             chosenRuntime = bundle.runtimeInstallation
             baseLayout = bundle.layout

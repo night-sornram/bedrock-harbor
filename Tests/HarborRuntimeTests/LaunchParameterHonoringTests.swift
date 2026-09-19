@@ -197,4 +197,33 @@ final class LaunchParameterHonoringTests: XCTestCase {
             "an unusable caller runtime must never be used"
         )
     }
+
+    func testCallerRuntimeWithSameReleaseIDAsDiscoveryStillUsesCallerRoot() async throws {
+        try writeInstalledPatch(names: ["1.26.40.0"])
+        // Two usable roots sharing the same runtime.json version: discovery's layout
+        // gets registered under the SAME releaseID as the caller's runtime, but at a
+        // different root. The registered layout must not hijack the caller's root.
+        _ = try makeUsableRuntimeRoot(name: "a-runtime", executableBytes: Data("exec-a".utf8))
+        let callerRoot = try makeUsableRuntimeRoot(name: "zz-caller", executableBytes: Data("exec-zz".utf8))
+        for root in [
+            supportRoot.appendingPathComponent("Runtimes/a-runtime", isDirectory: true),
+            callerRoot,
+        ] {
+            try Data(#"{"version":"v9.9.9-1"}"#.utf8).write(to: root.appendingPathComponent("runtime.json"))
+        }
+        let game = try makeGameInstallation(name: "1.26.40.0")
+
+        let supervisor = ProcessLaunchSupervisor(paths: makePaths())
+        let plan = try await supervisor.prepareLaunchPlan(
+            profile: Profile(name: "Test"),
+            installation: makeInstallation(gameDir: game, versionName: "1.26.40.0"),
+            runtime: makeRuntime(root: callerRoot, releaseID: "harbor-mcpelauncher-v9.9.9-1")
+        )
+
+        XCTAssertEqual(
+            plan.executableURL.standardizedFileURL.path,
+            callerRoot.appendingPathComponent("MacOS/mcpelauncher-client").standardizedFileURL.path,
+            "a same-named releaseID must not let discovery's layout override the caller's runtime root"
+        )
+    }
 }
