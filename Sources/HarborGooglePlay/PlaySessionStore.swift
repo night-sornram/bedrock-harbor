@@ -30,6 +30,7 @@ public enum PlaySessionStore {
     public static func save(cookies: [String: String], email: String?) {
         defaults.set(cookies, forKey: defaultsCookiesKey)
         if let email { defaults.set(email, forKey: defaultsEmailKey) }
+        else { defaults.removeObject(forKey: defaultsEmailKey) }
         let payload = Payload(cookies: cookies, email: email, savedAt: Date())
         if let data = try? JSONEncoder().encode(payload) {
             try? FileManager.default.createDirectory(
@@ -54,6 +55,14 @@ public enum PlaySessionStore {
 
     public static var isReady: Bool {
         !load().cookies.isEmpty
+    }
+
+    public static func clear() throws {
+        defaults.removeObject(forKey: defaultsCookiesKey)
+        defaults.removeObject(forKey: defaultsEmailKey)
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            try FileManager.default.removeItem(at: fileURL)
+        }
     }
 
     /// Harvest cookies from the live WebKit store (called at install time).

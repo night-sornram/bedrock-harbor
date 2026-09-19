@@ -11,6 +11,7 @@ import SwiftUI
 final class AppBootstrap {
     static let shared = AppBootstrap()
     var services: HarborServiceBundle?
+    var rootModel: HarborRootModel?
     var startupError: String?
     var bootstrapNote: String = ""
     private var didStart = false
@@ -28,6 +29,10 @@ final class AppBootstrap {
                 runtimeLauncher: launcher
             )
             services = bundle
+            // Keep one session owner across view recomputations and windows.
+            // Recreating it in RootHost would revalidate credentials on every
+            // bootstrap update and let different windows disagree on sign-out.
+            rootModel = HarborRootModel(services: bundle)
             Task {
                 await timing.begin(kind: "appStart")
                 await timing.mark(.appLaunch)
@@ -82,8 +87,8 @@ struct RootHost: View {
     let bootstrap: AppBootstrap
     var body: some View {
         Group {
-            if let services = bootstrap.services {
-                HarborRootView(services: services)
+            if let model = bootstrap.rootModel {
+                HarborRootView(model: model)
             } else {
                 VStack(spacing: 12) {
                     ProgressView()

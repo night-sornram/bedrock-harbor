@@ -11,6 +11,7 @@ public:
     bool opt_interactive = false;
     std::string opt_email, opt_password, opt_token;
     std::string opt_access_token;
+    bool opt_auth_check = false;
     bool opt_save_auth = false, opt_login_no_verify = false;
     bool opt_accept_tos = false;
     std::string opt_device_path = "devices/default.conf";

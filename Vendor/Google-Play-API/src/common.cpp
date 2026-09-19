@@ -14,6 +14,16 @@
 
 using namespace playapi;
 
+// Keep rejected credentials distinct from offline/transport/service errors.
+// Never emit the raw exception: upstream messages can contain auth material.
+static void report_auth_failure(const std::runtime_error& error) {
+    const std::string reason = error.what();
+    const bool rejected = reason == "Login error: BadAuthentication" ||
+        reason == "Login error: InvalidCredentials" || reason == "Login error: TokenExpired";
+    std::cerr << (rejected ? "authentication rejected" : "authentication unavailable") << std::endl;
+    exit(rejected ? 3 : 2);
+}
+
 playapi_cli_base::playapi_cli_base() : conf("playdl.conf"), login_cache("token_cache.conf"),
     login_api(device, login_cache), api(device) {
 
@@ -107,8 +117,7 @@ void playapi_cli_base::do_auth_from_config() {
         login_api.verify()->call();
     } catch (std::runtime_error &err) {
         if (!opt_interactive) {
-            std::cerr << "error: bad saved token" << std::endl;
-            exit(1);
+            report_auth_failure(err);
         }
 
         std::cout << "Failed to login using a saved token: " << err.what() << std::endl;
@@ -131,6 +140,8 @@ void playapi_cli_base::print_global_help() {
     std::cout << "-u   --email            Email to use for automatic login" << std::endl;
     std::cout << "-p   --password         Password to use for automatic login" << std::endl;
     std::cout << "-t   --token            Token to use for automatic login" << std::endl;
+    std::cout << "     --access-token-file Read an access token from a private file" << std::endl;
+    std::cout << "     --auth-check       Verify credentials without store operations (gplayver)" << std::endl;
     std::cout << "-sa  --save-auth        Save authentication information to file" << std::endl;
     std::cout << "-tos --accept-tos       Automatically accept ToS if needed" << std::endl;
     std::cout << "-d   --device           Use the specified device configuration file" << std::endl;
@@ -148,6 +159,15 @@ bool playapi_cli_base::parse_arg(arg_list &list, const char *key) {
         opt_token = list.next_value();
     else if (strcmp(key, "-at") == 0 || strcmp(key, "--access-token") == 0)
         opt_access_token = list.next_value();
+    else if (strcmp(key, "--access-token-file") == 0) {
+        std::ifstream token_file(list.next_value());
+        if (!token_file || !std::getline(token_file, opt_access_token) || opt_access_token.empty()) {
+            std::cerr << "access token file unavailable" << std::endl;
+            exit(2);
+        }
+    }
+    else if (strcmp(key, "--auth-check") == 0)
+        opt_auth_check = true;
     else if (strcmp(key, "-sa") == 0 || strcmp(key, "--save-auth") == 0)
         opt_save_auth = true;
     else if (strcmp(key, "-tos") == 0 || strcmp(key, "--accept-tos") == 0)
@@ -182,6 +202,10 @@ void playapi_cli_base::parse_args(int argc, const char **argv) {
 }
 
 void playapi_cli_base::perform_auth() {
+    if (opt_auth_check && opt_login_no_verify) {
+        std::cerr << "authentication check requires verification" << std::endl;
+        exit(2);
+    }
     {
         std::ifstream dev_info_file(opt_device_path);
         config dev_info_conf;
@@ -204,8 +228,7 @@ void playapi_cli_base::perform_auth() {
         try {
             login_api.perform_with_access_token(opt_access_token, opt_email)->call();
         } catch (std::runtime_error &err) {
-            std::cerr << "error: bad access token" << std::endl;
-            exit(1);
+            report_auth_failure(err);
         }
         if (opt_save_auth && login_api.has_token()) {
             conf.user_email = login_api.get_email();
@@ -218,8 +241,7 @@ void playapi_cli_base::perform_auth() {
             try {
                 login_api.verify()->call();
             } catch (std::runtime_error &err) {
-                std::cerr << "error: bad token" << std::endl;
-                exit(1);
+                report_auth_failure(err);
             }
         }
     } else if (conf.user_token.length() <= 0) {
@@ -238,6 +260,15 @@ void playapi_cli_base::perform_auth() {
         }
     } else {
         do_auth_from_config();
+    }
+    if (opt_auth_check) {
+        if (opt_save_auth && login_api.has_token()) {
+            conf.user_email = login_api.get_email();
+            conf.user_token = login_api.get_token();
+            conf.save();
+        }
+        std::cout << "authentication verified" << std::endl;
+        return;
     }
     if (dev_state.checkin_data.android_id == 0) {
         checkin_api checkin(device);

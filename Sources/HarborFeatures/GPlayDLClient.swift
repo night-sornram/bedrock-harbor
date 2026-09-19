@@ -1,5 +1,6 @@
 import Foundation
 import HarborRuntime
+import HarborPlatform
 
 /// Bridge to the community Google-Play-API CLI tools (gplaydl/gplayver,
 /// vendored under Vendor/Google-Play-API and bundled into the app by
@@ -57,10 +58,18 @@ enum PlayCredentialBackup {
             try? data.write(to: url, options: .atomic)
         }
     }
+
+    static func clear() throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
 }
 
 @MainActor
 enum GPlayDLClient {
+
+    nonisolated(unsafe) static var workDirOverride: URL?
 
     struct DownloadResult {
         let files: [URL]
@@ -69,7 +78,7 @@ enum GPlayDLClient {
     }
 
     nonisolated static var workDir: URL {
-        LocalRuntimeDiscovery.harborSupport.appendingPathComponent("PlayAPI", isDirectory: true)
+        workDirOverride ?? LocalRuntimeDiscovery.harborSupport.appendingPathComponent("PlayAPI", isDirectory: true)
     }
 
     static func locateBinary(named name: String) -> URL? {
@@ -112,8 +121,7 @@ enum GPlayDLClient {
         status("Google Play: checking latest Minecraft version…")
         let verArgs = ["--device", "device.conf", "--app", "com.mojang.minecraftpe", "--accept-tos"] + authArgs
         var versionRun = await run(ver, verArgs)
-        if versionRun.code != 0,
-           !versionRun.err.contains("bad token"), !versionRun.err.contains("bad saved token") {
+        if versionRun.code != 0, versionRun.code != 3, !Task.isCancelled {
             // The first-ever run does a device checkin and can fail cold once —
             // retry before reporting anything; without this, Install "works on
             // the second click" and shows a scary error the first time.
@@ -125,11 +133,9 @@ enum GPlayDLClient {
               let matched = versionRun.out.range(of: #"version string: \S+"#, options: .regularExpression)
         else {
             let err = versionRun.err
-            if err.contains("bad token") || err.contains("bad saved token") {
-                // Expired/revoked credentials: drop them so the next run asks
-                // for a fresh sign-in instead of failing forever.
-                try? fm.removeItem(at: workDir.appendingPathComponent("playdl.conf"))
-                PlayCredentialBackup.clearMaster()
+            if versionRun.code == 3 {
+                // Do not delete credentials on transport/service failures.
+                // The coordinator rechecks and exposes an expired session.
                 status("Google login expired — sign in once more, then Install")
             } else {
                 status("Play version check failed: \(err.isEmpty ? versionRun.out : err)")
@@ -242,61 +248,30 @@ enum GPlayDLClient {
         return fm.fileExists(atPath: workDir.appendingPathComponent("playdl.conf").path)
     }
 
-    /// Runs a CLI tool in the PlayAPI working directory. The wait happens on a
-    /// background queue so a long download never blocks the UI. When `progress`
-    /// is given, gplaydl's \r-separated "Downloaded N%" lines are streamed to
-    /// it once per second — a silent multi-minute download looks stuck and
-    /// invites duplicate clicks.
+    /// Bounded, cancellable process execution. gplaydl writes progress to
+    /// stdout; both streams are supported and updates are throttled.
     private nonisolated static func run(
         _ binary: URL,
         _ args: [String],
         progress: StatusForwarder? = nil
     ) async -> (code: Int32, out: String, err: String) {
-        let outBox = PipeBuffer()
-        let errBox = PipeBuffer()
-        let p = Process()
-        p.executableURL = binary
-        p.currentDirectoryURL = workDir
-        p.arguments = args
-        let outPipe = Pipe(), errPipe = Pipe()
-        p.standardOutput = outPipe
-        p.standardError = errPipe
-        outPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty { handle.readabilityHandler = nil } else { outBox.append(chunk) }
-        }
-        errPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty { handle.readabilityHandler = nil } else { errBox.append(chunk) }
+        let progressBuffer = PipeBuffer()
+        let forward: @Sendable (Data) -> Void = { chunk in
+            progressBuffer.append(chunk)
+            if let line = progressBuffer.progressLine { progress?.send(line) }
         }
         do {
-            try p.run()
-            let exitBox = ExitFlag()
-            let waiter = Task {
-                p.waitUntilExit()
-                exitBox.set()
-            }
-            if progress != nil {
-                while !exitBox.isSet {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    if let line = errBox.progressLine { progress?.send(line) }
-                }
-            }
-            await waiter.value
+            let result = try await HarborSubprocess.run(
+                executable: binary, arguments: args, currentDirectory: workDir,
+                timeout: progress == nil ? 45 : 1800,
+                onStandardOutput: forward,
+                onStandardError: forward
+            )
+            return (result.exitCode, result.stdout, result.stderr)
         } catch {
-            return (-1, "", error.localizedDescription)
+            return (-1, "", "Google Play request was cancelled or could not start.")
         }
-        // Let trailing pipe data land before reading the buffers.
-        try? await Task.sleep(nanoseconds: 50_000_000)
-        return (p.terminationStatus, outBox.string, errBox.string)
     }
-}
-
-private final class ExitFlag: @unchecked Sendable {
-    private var exited = false
-    private let lock = NSLock()
-    func set() { lock.lock(); exited = true; lock.unlock() }
-    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return exited }
 }
 
 /// Delivers progress lines off the main actor; the handler only schedules a
@@ -309,10 +284,12 @@ private final class StatusForwarder: @unchecked Sendable {
 
 private final class PipeBuffer: @unchecked Sendable {
     private var data = Data()
+    private var lastProgress = Date.distantPast
     private let lock = NSLock()
     func append(_ chunk: Data) {
         lock.lock()
-        data += chunk
+        data.append(chunk)
+        if data.count > 4096 { data = Data(data.suffix(4096)) }
         lock.unlock()
     }
     var string: String {
@@ -324,7 +301,9 @@ private final class PipeBuffer: @unchecked Sendable {
     var progressLine: String? {
         lock.lock()
         defer { lock.unlock() }
-        let text = String(data: data, encoding: .utf8) ?? ""
+        guard Date().timeIntervalSince(lastProgress) >= 0.5 else { return nil }
+        lastProgress = Date()
+        let text = String(decoding: data, as: UTF8.self)
         return text.split(whereSeparator: { $0 == "\n" || $0 == "\r" })
             .last(where: { $0.contains("Downloaded") })
             .map(String.init)

@@ -51,9 +51,12 @@ public enum HarborSubprocess {
         currentDirectory: URL? = nil,
         environment: [String: String]? = nil,
         timeout: TimeInterval? = nil,
-        outputLimit: Int = 64_000
+        outputLimit: Int = 64_000,
+        onStandardOutput: (@Sendable (Data) -> Void)? = nil,
+        onStandardError: (@Sendable (Data) -> Void)? = nil
     ) async throws -> SubprocessResult {
         precondition(outputLimit >= 0, "outputLimit must not be negative")
+        try Task.checkCancellation()
 
         let process = Process()
         process.executableURL = executable
@@ -82,8 +85,8 @@ public enum HarborSubprocess {
         }
         let pid = process.processIdentifier
 
-        drain(stdoutPipe.fileHandleForReading, into: stdoutTap)
-        drain(stderrPipe.fileHandleForReading, into: stderrTap)
+        drain(stdoutPipe.fileHandleForReading, into: stdoutTap, onChunk: onStandardOutput)
+        drain(stderrPipe.fileHandleForReading, into: stderrTap, onChunk: onStandardError)
 
         // Timeout: SIGTERM first, SIGKILL after a grace period as the hang
         // safety net (a tool that ignores SIGTERM must still be bounded).
@@ -94,21 +97,29 @@ public enum HarborSubprocess {
             timeoutTask = Task {
                 try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
                 guard !Task.isCancelled else { return }
-                gate.markTimedOut()
-                kill(pid, SIGTERM)
+                gate.signal(pid: pid, signal: SIGTERM, timedOut: true)
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard !Task.isCancelled else { return }
-                kill(pid, SIGKILL)
+                gate.signal(pid: pid, signal: SIGKILL)
             }
         } else {
             timeoutTask = nil
         }
         defer { timeoutTask?.cancel() }
 
-        let status = await withCheckedContinuation { exitGate.install($0) }
+        let status = await withTaskCancellationHandler {
+            await withCheckedContinuation { exitGate.install($0) }
+        } onCancel: {
+            exitGate.signal(pid: pid, signal: SIGTERM)
+            Task.detached {
+                try? await Task.sleep(for: .seconds(2))
+                exitGate.signal(pid: pid, signal: SIGKILL)
+            }
+        }
         // Wait for both pipes to hit EOF so trailing output cannot race the snapshot.
         await withCheckedContinuation { stdoutTap.awaitEOF($0) }
         await withCheckedContinuation { stderrTap.awaitEOF($0) }
+        try Task.checkCancellation()
 
         return SubprocessResult(
             exitCode: status,
@@ -124,7 +135,7 @@ public enum HarborSubprocess {
     /// Foundation only re-invokes the handler after the previous call returns,
     /// so at most one chunk per pipe is in flight. Same pattern as
     /// `ProcessIO.ProcessPipeDrainer`.
-    private static func drain(_ handle: FileHandle, into tap: PipeTap) {
+    private static func drain(_ handle: FileHandle, into tap: PipeTap, onChunk: (@Sendable (Data) -> Void)? = nil) {
         handle.readabilityHandler = { @Sendable readHandle in
             let chunk = readHandle.availableData
             if chunk.isEmpty {
@@ -133,6 +144,7 @@ public enum HarborSubprocess {
                 tap.reachEOF()
             } else {
                 tap.append(chunk)
+                onChunk?(chunk)
             }
         }
     }
@@ -168,10 +180,12 @@ private final class TerminationGate: @unchecked Sendable {
         continuation = nil
     }
 
-    func markTimedOut() {
+    func signal(pid: pid_t, signal: Int32, timedOut: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
-        timedOutFlag = true
+        guard status == nil else { return }
+        if timedOut { timedOutFlag = true }
+        kill(pid, signal)
     }
 
     var timedOut: Bool {

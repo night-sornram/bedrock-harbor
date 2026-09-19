@@ -6,6 +6,8 @@ import HarborCompatibility
 import HarborDomain
 import HarborGooglePlay
 import HarborPlatform
+import AppKit
+import SwiftUI
 
 @MainActor
 @Suite("AppState install gate", .serialized)
@@ -36,6 +38,8 @@ struct AppStateInstallGateTests {
     /// that is really there (or claims ready for one that isn't).
     @Test func verifiedGameRequiresReceiptOnDisk() async throws {
         let services = try makeServices()
+        resetPlayState()
+        defer { resetPlayState() }
         let gameDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("bh-game-\(UUID().uuidString)", isDirectory: true)
         let lib = gameDir.appendingPathComponent("lib/arm64-v8a/libminecraftpe.so")
@@ -62,6 +66,8 @@ struct AppStateInstallGateTests {
         await app.reload()
         #expect(app.hasVerifiedGame)
         #expect(app.nextStep == 3)
+        #expect(!app.googlePlayStepIsComplete)
+        #expect(app.googlePlayStepIsOptional)
 
         try FileManager.default.removeItem(at: gameDir)
         await app.reload()
@@ -239,6 +245,8 @@ struct AppStateInstallGateTests {
         d.removeObject(forKey: "com.bedrockharbor.play.oauth")
         d.removeObject(forKey: "com.bedrockharbor.play.cookies")
         d.removeObject(forKey: "com.bedrockharbor.play.email")
+        d.removeObject(forKey: "com.bedrockharbor.play.accountEmail")
+        try? FileManager.default.removeItem(at: GPlayDLClient.workDir)
         let support = PlayStoreIsolation.home
             .appendingPathComponent("Library/Application Support/BedrockHarbor", isDirectory: true)
         try? FileManager.default.removeItem(at: support.appendingPathComponent("play-session.json"))
@@ -249,41 +257,175 @@ struct AppStateInstallGateTests {
             at: PlayStoreIsolation.home.appendingPathComponent(".bedrockharbor/credentials.json"))
     }
 
-    /// A token string saved over an anonymous cookie bag is a failed-login
-    /// leftover (the loop bug): reload must self-heal to signed-out, not claim
-    /// "Google Play ready" for a session that never signed in. A completed
-    /// sign-in (oauth_token cookie in the bag) must survive the same reload.
-    @Test func playSessionSelfHealsFromAnonymousLeftover() async throws {
-        PlayStoreIsolation.activate()
+    @Test func savedCredentialsDoNotProveGoogleSignIn() async throws {
+        let services = try makeServices()
         resetPlayState()
         defer { resetPlayState() }
+        PlayCredentialBackup.save(master: "expired-test-master", email: "saved@example.com")
+        let app = AppState(services: services)
+        await app.reload()
+        #expect(!app.isPlaySignedIn, "A saved credential must be validated before Accounts claims signed in")
+    }
 
-        // Phase 1: anonymous leftover → signed out + cleared.
-        let stale = try makeServices()
-        HarborPlayTokenBridge.saveOAuthToken("oauth2_4/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB")
-        PlaySessionStore.save(cookies: ["NID": "n", "OTZ": "o"], email: "a@gmail.com")
-        try await stale.metadata.saveAccounts([
-            AccountRecord(
-                providerID: .googlePlay,
-                accountLabel: "a@gmail.com",
-                sessionState: .ready,
-                keychainReference: "test"
-            )
+    @Test func otherProviderAccountDoesNotSignInGooglePlay() async throws {
+        let services = try makeServices()
+        resetPlayState()
+        defer { resetPlayState() }
+        try await services.metadata.saveAccounts([
+            AccountRecord(providerID: ProviderID(rawValue: "other-provider"),
+                          accountLabel: "other@example.com", sessionState: .ready,
+                          keychainReference: "test")
         ])
-        let staleApp = AppState(services: stale)
-        await staleApp.reload()
-        #expect(!staleApp.isPlaySignedIn, "anonymous cookie bag must not count as signed in")
-        #expect(HarborPlayTokenBridge.loadOAuthToken() == nil, "leftover token must be cleared")
-        #expect(!staleApp.accounts.contains { $0.providerID == .googlePlay })
+        let app = AppState(services: services)
+        await app.reload()
+        #expect(!app.isPlaySignedIn)
+        #expect(app.playAccountLabel.isEmpty)
+    }
 
-        // Phase 2: completed sign-in → kept.
-        let live = try makeServices()
+    @Test func storedBrowserSessionNeedsValidation() async throws {
+        let services = try makeServices()
+        resetPlayState()
+        defer { resetPlayState() }
         let token = "oauth2_4/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB"
         HarborPlayTokenBridge.saveOAuthToken(token)
-        PlaySessionStore.save(cookies: ["oauth_token": token, "SID": "s"], email: "a@gmail.com")
-        let liveApp = AppState(services: live)
-        await liveApp.reload()
-        #expect(liveApp.isPlaySignedIn, "oauth_token cookie in the bag is a real completed sign-in")
+        PlaySessionStore.save(cookies: ["oauth_token": token, "SID": "s"], email: "saved@example.com")
+        let app = AppState(services: services)
+        await app.reload()
+        let signedIn = app.isPlaySignedIn
+        #expect(!signedIn)
+        #expect(HarborPlayTokenBridge.loadOAuthToken() == token,
+                "An unverified/offline session must not be destroyed on reload")
+    }
+
+    @Test func signOutClearsEveryHarborGoogleStoreAndKeepsOtherAccounts() async throws {
+        let services = try makeServices()
+        resetPlayState()
+        defer { resetPlayState() }
+        let token = "oauth2_4/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB"
+        HarborPlayTokenBridge.saveOAuthToken(token)
+        HarborPlayTokenBridge.saveAccountEmail("old@example.com")
+        PlaySessionStore.save(cookies: ["oauth_token": token], email: "old@example.com")
+        PlayCredentialBackup.save(oauth: token, master: "test-master", email: "old@example.com")
+        let fm = FileManager.default
+        try fm.createDirectory(at: GPlayDLClient.workDir, withIntermediateDirectories: true)
+        for name in ["playdl.conf", "token_cache.conf", "device.conf.state"] {
+            try "user_token = test-master\n".write(to: GPlayDLClient.workDir.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let other = AccountRecord(providerID: ProviderID(rawValue: "other-provider"),
+                                  accountLabel: "other@example.com", sessionState: .ready, keychainReference: "other")
+        try await services.metadata.saveAccounts([
+            other, AccountRecord(providerID: .googlePlay, accountLabel: "old@example.com", sessionState: .ready, keychainReference: "google")
+        ])
+        var clearedBrowser = false
+        let backend = LivePlaySessionBackend(metadata: services.metadata, clearBrowserCookies: { clearedBrowser = true })
+        try await backend.clear()
+        #expect(clearedBrowser)
+        #expect(!backend.hasSavedCredentials())
+        #expect(HarborPlayTokenBridge.loadOAuthToken() == nil)
+        #expect(HarborPlayTokenBridge.loadAccountEmail() == nil)
+        #expect(PlaySessionStore.load().cookies.isEmpty)
+        #expect(PlaySessionStore.load().accountEmail == nil)
+        #expect(PlayCredentialBackup.load().master == nil)
+        #expect(PlayCredentialBackup.load().oauth == nil)
+        #expect(try await services.metadata.loadAccounts() == [other])
+        for name in ["playdl.conf", "token_cache.conf", "device.conf.state"] {
+            #expect(!fm.fileExists(atPath: GPlayDLClient.workDir.appendingPathComponent(name).path))
+        }
+        let restarted = AppState(services: services)
+        await restarted.reload()
+        #expect(restarted.playSession.status == .signedOut)
+        #expect(restarted.playAccountLabel.isEmpty)
+    }
+
+    @Test func authCheckUsesPrivateFilesAndCommitsOnlyVerifiedSession() async throws {
+        let services = try makeServices()
+        resetPlayState()
+        defer { resetPlayState() }
+        HarborPlayTokenBridge.saveOAuthToken("oauth2_4/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB")
+        let backend = LivePlaySessionBackend(
+            metadata: services.metadata, clearBrowserCookies: {},
+            binary: { URL(fileURLWithPath: "/test/gplayver") },
+            runCheck: { _, args, directory in
+                #expect(args.contains("--auth-check"))
+                #expect(args.contains("--access-token-file"))
+                #expect(!args.contains { $0.contains("oauth2_") })
+                #expect(!args.contains("--accept-tos"))
+                let attrs = try FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent("access-token").path)
+                #expect((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+                try "user_email = verified@example.com\nuser_token = verified-master\n".write(
+                    to: directory.appendingPathComponent("playdl.conf"), atomically: true, encoding: .utf8)
+                return SubprocessResult(exitCode: 0, stdout: "authentication verified\n", stderr: "", timedOut: false, truncated: false)
+            }
+        )
+        let session = PlaySessionCoordinator(backend: backend)
+        session.restoreIfNeeded()
+        await session.waitForValidation()
+        #expect(session.status == .signedIn(email: "verified@example.com", restored: true))
+        #expect(FileManager.default.fileExists(atPath: GPlayDLClient.workDir.appendingPathComponent("playdl.conf").path))
+    }
+
+    @Test func failedAuthCheckDoesNotCommitStagedCredentialsOrEraseSavedToken() async throws {
+        let services = try makeServices()
+        resetPlayState()
+        defer { resetPlayState() }
+        let token = "oauth2_4/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBB"
+        HarborPlayTokenBridge.saveOAuthToken(token)
+        for code: Int32 in [2, 3] {
+            let backend = LivePlaySessionBackend(
+                metadata: services.metadata, clearBrowserCookies: {},
+                binary: { URL(fileURLWithPath: "/test/gplayver") },
+                runCheck: { _, _, directory in
+                    try "user_email = partial@example.com\nuser_token = partial-token\n".write(
+                        to: directory.appendingPathComponent("playdl.conf"), atomically: true, encoding: .utf8)
+                    return SubprocessResult(exitCode: code, stdout: "", stderr: "", timedOut: false, truncated: false)
+                }
+            )
+            let session = PlaySessionCoordinator(backend: backend)
+            session.restoreIfNeeded()
+            await session.waitForValidation()
+            #expect(!session.status.isSignedIn)
+            #expect((session.status == .expired) == (code == 3))
+            #expect(HarborPlayTokenBridge.loadOAuthToken() == token)
+            #expect(!FileManager.default.fileExists(atPath: GPlayDLClient.workDir.appendingPathComponent("playdl.conf").path))
+        }
+    }
+
+    @Test func savingAnonymousCookiesClearsRememberedEmail() throws {
+        _ = try makeServices()
+        resetPlayState()
+        defer { resetPlayState() }
+        PlaySessionStore.save(cookies: ["SID": "test"], email: "stale@example.com")
+        PlaySessionStore.save(cookies: [:], email: nil)
+        #expect(PlaySessionStore.load().accountEmail == nil)
+    }
+
+    @Test func signedOutAccountsAndLocalPlayRenderInBothAppearances() async throws {
+        let services = try makeServices()
+        resetPlayState()
+        defer { resetPlayState() }
+        let app = AppState(services: services)
+        await app.reload()
+        app.hasVerifiedGame = true
+        for scheme in [ColorScheme.light, .dark] {
+            let appearance = scheme == .light ? "light" : "dark"
+            let screens: [(String, AnyView)] = [
+                ("accounts", AnyView(AccountsView(app: app, onRecovery: { _ in }))),
+                ("play", AnyView(PlayView(app: app, onRecovery: { _ in })))
+            ]
+            for (name, view) in screens {
+                let renderer = ImageRenderer(content: view
+                    .frame(width: 700, height: 550)
+                    .background(scheme == .light ? Color.white : Color(nsColor: .windowBackgroundColor))
+                    .environment(\.colorScheme, scheme))
+                let image = try #require(renderer.cgImage)
+                #expect(image.width == 700 && image.height == 550)
+                if let directory = ProcessInfo.processInfo.environment["HARBOR_UI_SNAPSHOTS"] {
+                    let rep = NSBitmapImageRep(cgImage: image)
+                    let data = try #require(rep.representation(using: .png, properties: [:]))
+                    try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent("\(name)-\(appearance).png"))
+                }
+            }
+        }
     }
 
     /// Credentials must survive Application Support wipes — they live in a

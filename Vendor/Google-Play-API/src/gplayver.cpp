@@ -66,7 +66,7 @@ int main(int argc, char* argv[]) {
     playapi_cli_ver cli;
     cli.parse_args(argc, (const char **) argv);
     cli.perform_auth();
-    cli.run();
+    if (!cli.opt_auth_check) cli.run();
 
     curl_global_cleanup();
     google::protobuf::ShutdownProtobufLibrary();

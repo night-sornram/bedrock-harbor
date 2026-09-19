@@ -50,12 +50,14 @@ public struct StepRow: View {
     public let subtitle: String
     public let done: Bool
     public let active: Bool
-    public init(n: Int, title: String, subtitle: String, done: Bool, active: Bool) {
+    public let optional: Bool
+    public init(n: Int, title: String, subtitle: String, done: Bool, active: Bool, optional: Bool = false) {
         self.n = n
         self.title = title
         self.subtitle = subtitle
         self.done = done
         self.active = active
+        self.optional = optional
     }
     public var body: some View {
         HStack(spacing: 12) {
@@ -68,6 +70,9 @@ public struct StepRow: View {
                         .font(.caption.bold())
                         .foregroundStyle(.white)
                         .accessibilityLabel("Done")
+                } else if optional {
+                    Image(systemName: "minus").foregroundStyle(.secondary)
+                        .accessibilityLabel("Optional")
                 } else {
                     Text("\(n)").font(.caption.bold())
                         .foregroundStyle(active ? .white : .secondary)
@@ -168,28 +173,28 @@ public final class AppState {
     public var selectedProfileID: UUID?
     public var isGameRunning = false
     public var isInstalling = false
-    public var signInBusy = false
+    public var signInBusy: Bool { playSession.status.isBusy }
     /// Active download progress (0...1); nil when nothing measurable is downloading.
     /// Percentages are shown for downloads only — launch stages are named, not faked.
     public var downloadProgress: Double?
     public var downloadDetail = ""
     public var downloadLabel = ""
-    public var playAccountLabel = ""
+    public var playAccountLabel: String { playSession.status.email ?? "" }
     public var accounts: [AccountRecord] = []
     /// Internal first-run hint. Never gates navigation — the app always opens on
     /// Play; the readiness checklist there shows what is missing instead.
     public var needsOnboarding = true
     public var doctorFindings: [DoctorFinding] = []
 
-    // Derived snapshot: these used to be computed properties that hit the
-    // filesystem, the Keychain/token bridge, and UserDefaults on every SwiftUI
-    // render. They are now stored values refreshed by `refreshDerivedState()`
-    // from `reload()` and after every mutating action — views only ever read
-    // the stored fields.
+    // Installation snapshots are refreshed outside SwiftUI rendering. Google
+    // status comes exclusively from the shared session coordinator.
     public var gameInstallation: InstalledMinecraft?
     public var runtime: RuntimeInstallation?
     public var hasVerifiedGame = false
-    public var isPlaySignedIn = false
+    public var isPlaySignedIn: Bool { playSession.status.isSignedIn }
+    public let playSession: PlaySessionCoordinator
+    public var googlePlayStepIsComplete: Bool { isPlaySignedIn }
+    public var googlePlayStepIsOptional: Bool { !isPlaySignedIn && (hasVerifiedGame || usedLocalAPK) }
     /// Snapshot of the "user plays from a local package" default (Task 6
     /// pattern): written via `useLocalAPK()` / `resetSetup()`, read from
     // UserDefaults only inside `refreshDerivedState()` — never per render.
@@ -229,7 +234,8 @@ public final class AppState {
     /// than the default. Marks after the timing session ends are ignored.
     private static let microsoftHelperWatchTimeout: TimeInterval = 600
 
-    public init(services: HarborServiceBundle) {
+    public init(services: HarborServiceBundle, playSession: PlaySessionCoordinator? = nil) {
+        self.playSession = playSession ?? PlaySessionCoordinator(backend: LivePlaySessionBackend(metadata: services.metadata))
         self.services = services
         self.sessionCoordinator = GameSessionCoordinator(services: services)
         self.needsOnboarding = !Self.defaults.bool(forKey: Self.localAPKKey)
@@ -253,9 +259,8 @@ public final class AppState {
             ?? profiles.first
     }
 
-    /// Recomputes the derived snapshot (gameInstallation, runtime,
-    /// hasVerifiedGame, isPlaySignedIn, usedLocalAPK) from the freshly loaded
-    /// arrays and the credential stores. Runs inside `reload()` and after
+    /// Recomputes installation readiness from freshly loaded metadata.
+    /// Runs inside `reload()` and after
     /// mutating actions — never from a SwiftUI `body`.
     func refreshDerivedState() {
         let profile = selectedProfile
@@ -291,21 +296,6 @@ public final class AppState {
         } else {
             hasVerifiedGame = false
         }
-
-        isPlaySignedIn = computePlaySignedIn()
-    }
-
-    /// Credential snapshot behind `isPlaySignedIn`. Same semantics as the old
-    /// per-render computed property (including the wipe-surviving backup),
-    /// computed once per reload/action instead of per SwiftUI render.
-    private func computePlaySignedIn() -> Bool {
-        if HarborPlayTokenBridge.loadOAuthToken() != nil { return true }
-        if PlaySessionStore.load().cookies["oauth_token"] != nil { return true }
-        // Wipe-surviving credential backup (see PlayCredentialBackup) — after a
-        // data wipe the app is still truthfully signed in for downloads.
-        let backup = PlayCredentialBackup.load()
-        if backup.master != nil || backup.oauth != nil { return true }
-        return accounts.contains { $0.sessionState == .ready && $0.accountLabel.contains("@") }
     }
 
     public var nextStep: Int {
@@ -330,35 +320,10 @@ public final class AppState {
         installations = (try? await services.metadata.loadInstallations()) ?? []
         runtimes = (try? await services.metadata.loadRuntimeInstallations()) ?? []
         accounts = (try? await services.metadata.loadAccounts()) ?? []
-        await reconcilePersistedPlaySession()
-        if let ready = accounts.first(where: { $0.sessionState == .ready }) {
-            playAccountLabel = ready.accountLabel
-        }
+        playSession.restoreIfNeeded()
         if selectedProfileID == nil { selectedProfileID = profiles.first?.id }
         refreshDerivedState()
         refreshGate()
-    }
-
-    /// A stored Play token sitting on an anonymous cookie bag (no oauth_token
-    /// cookie, no Google session cookies) cannot install anything — it is a
-    /// leftover from a login that faked completion. Clear it instead of
-    /// claiming "Google Play ready" for a session that never really signed in.
-    private func reconcilePersistedPlaySession() async {
-        let session = PlaySessionStore.load()
-        let hasSessionCookies = [
-            "SID", "SAPISID", "HSID", "LSID", "SIDCC",
-            "__Secure-3PSID", "__Secure-3PAPISID",
-        ].contains { session.cookies[$0] != nil }
-        let hasPlayAccount = accounts.contains { $0.providerID == .googlePlay }
-        guard session.cookies["oauth_token"] == nil,
-              !hasSessionCookies,
-              HarborPlayTokenBridge.loadOAuthToken() != nil || hasPlayAccount
-        else { return }
-        HarborPlayTokenBridge.clearOAuthToken()
-        PlaySessionStore.save(cookies: [:], email: nil)
-        accounts.removeAll { $0.providerID == .googlePlay }
-        try? await services.metadata.saveAccounts(accounts)
-        playAccountLabel = ""
     }
 
     public func completeOnboardingFromLogin() {
@@ -461,89 +426,21 @@ public final class AppState {
         return true
     }
 
-    /// Wait for sign-in sheet exactly once (observer + timeout must not both resume).
-    private final class ResumeOnce: @unchecked Sendable {
-        private var done = false
-        private let lock = NSLock()
-        func resume(_ cont: CheckedContinuation<Void, Never>) {
-            lock.lock()
-            let already = done
-            done = true
-            lock.unlock()
-            if !already { cont.resume() }
-        }
-    }
-
     private final class ObserverBox: @unchecked Sendable {
         var token: NSObjectProtocol?
     }
 
     public func googleSignIn(fresh: Bool = false) async {
-        signInBusy = true
-        defer { signInBusy = false }
-        accountOperations.begin(fresh ? "Opening Google sign-in (fresh Android setup)…" : "Opening Google sign-in…")
-        GoogleSignInController.shared.present(freshLogin: fresh)
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            let once = ResumeOnce()
-            let observerBox = ObserverBox()
-            let center = NotificationCenter.default
-            observerBox.token = center.addObserver(forName: .bhGoogleSignInFinished, object: nil, queue: .main) { _ in
-                if let token = observerBox.token { center.removeObserver(token) }
-                once.resume(cont)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 180) {
-                if let token = observerBox.token { center.removeObserver(token) }
-                once.resume(cont)
-            }
-        }
+        guard !signInBusy else { return }
+        accountOperations.reset()
+        await playSession.signIn(fresh: fresh)
+        await reload()
+    }
 
-        let session = PlaySessionStore.load()
-        let oauth = HarborPlayTokenBridge.loadOAuthToken() ?? session.cookies["oauth_token"]
-        var email = GoogleSignInController.shared.signedInEmail
-        if email == nil || !(email?.contains("@") ?? false) {
-            email = HarborPlayTokenBridge.loadAccountEmail()
-        }
-        if email == nil || !(email?.contains("@") ?? false) {
-            if session.accountEmail?.contains("@") == true { email = session.accountEmail }
-            else if let e = session.cookies["Email"], e.contains("@") { email = e }
-        }
-        let userID = session.cookies["user_id"]
-
-        if oauth != nil || (email?.contains("@") ?? false) {
-            if let email, email.contains("@") {
-                playAccountLabel = email
-                HarborPlayTokenBridge.saveAccountEmail(email)
-            } else if let userID {
-                playAccountLabel = "Play user \(userID.prefix(8))…"
-            } else {
-                playAccountLabel = "Google Play"
-            }
-            let account = AccountRecord(
-                providerID: .googlePlay,
-                accountLabel: playAccountLabel,
-                sessionState: .ready,
-                keychainReference: "play-\(UUID().uuidString)"
-            )
-            accounts.removeAll { $0.providerID == .googlePlay }
-            accounts.append(account)
-            try? await services.metadata.saveAccounts(accounts)
-            if oauth != nil {
-                completeOnboardingFromLogin()
-                accountOperations.succeed("Play token ready (\(playAccountLabel)) — next: Install Minecraft")
-            } else {
-                accountOperations.fail(
-                    "Signed in as \(playAccountLabel), but oauth_token missing — open Android setup once more.",
-                    recovery: .signInFresh
-                )
-                needsOnboarding = true
-                refreshGate()
-            }
-        } else {
-            accountOperations.fail(
-                "Google sign-in not finished — complete Android setup until status shows oauth_token.",
-                recovery: .signIn
-            )
-        }
+    public func googleSignOut() async {
+        guard !isInstalling else { return }
+        accountOperations.reset()
+        await playSession.signOut()
         await reload()
     }
 
@@ -569,41 +466,15 @@ public final class AppState {
         guard await ensureLauncherRuntimeInstalled(tracker: installOperations) else { return }
 
         installOperations.begin("Checking Google Play session…")
-        var auth = await PlaySessionStore.harvestFromWebKit(email: playAccountLabel.isEmpty ? nil : playAccountLabel)
-        if auth.cookies.isEmpty {
-            auth = PlaySessionStore.load()
+        playSession.restoreIfNeeded()
+        await playSession.waitForValidation()
+        if playSession.status == .signedOut { await googleSignIn() }
+        guard isPlaySignedIn else {
+            installOperations.fail("Google Play sign-in has not been verified. Check your session in Accounts.", recovery: .signIn)
+            return
         }
-
-        var oauth = HarborPlayTokenBridge.loadOAuthToken()
-        if oauth == nil, auth.cookies["oauth_token"] != nil {
-            oauth = auth.cookies["oauth_token"]
-            if let oauth { HarborPlayTokenBridge.saveOAuthToken(oauth) }
-        }
-
-        // Path A requires Android setup oauth_token — not only website cookies.
-        if oauth == nil {
-            installOperations.fail("Need a Play client token (oauth_token) — opening Google sign-in once.", recovery: .signIn)
-            needsOnboarding = true
-            refreshGate()
-            // Not fresh on purpose: wiping the WKWebView session on every retry
-            // throws away the user's Google login and reads as bot-like churn.
-            await googleSignIn()
-            auth = await PlaySessionStore.harvestFromWebKit(email: playAccountLabel.isEmpty ? nil : playAccountLabel)
-            if auth.cookies.isEmpty { auth = PlaySessionStore.load() }
-            oauth = HarborPlayTokenBridge.loadOAuthToken()
-            if oauth == nil { oauth = auth.cookies["oauth_token"] }
-            if oauth == nil {
-                installOperations.fail(
-                    "oauth_token not captured yet. In the Google window finish Android setup (I agree) until it shows oauth_token, then Install again.",
-                    recovery: .signIn
-                )
-                return
-            }
-        }
-
-        if auth.cookies.isEmpty {
-            auth = PlaySessionStore.load()
-        }
+        var auth = PlaySessionStore.load()
+        var oauth = HarborPlayTokenBridge.loadOAuthToken() ?? auth.cookies["oauth_token"]
 
         // Resolve email/user_id without bouncing to login when token already exists.
         var email = playAccountLabel.contains("@") ? playAccountLabel : nil
@@ -621,12 +492,6 @@ public final class AppState {
         } else {
             installOperations.begin("Play client token ready — installing with Harbor Play client…")
         }
-        if let email, email.contains("@") {
-            playAccountLabel = email
-        } else if playAccountLabel.isEmpty || playAccountLabel == "Google Play account" {
-            playAccountLabel = "Play user \(userID.prefix(8))…"
-        }
-
         // Community Google-Play-API client first: Google's delivery gateway
         // rejects Harbor's own client (HTTP 400) but accepts this one. First
         // run exchanges the sign-in access token for a master token that
@@ -670,6 +535,13 @@ public final class AppState {
             }
         }
 
+        // A credential may have expired since the background check. Do not
+        // keep showing a verified account while trying stale fallback tokens.
+        await playSession.retry()
+        guard isPlaySignedIn else {
+            installOperations.fail("Google Play could not verify this session. Check Accounts before retrying.", recovery: .signIn)
+            return
+        }
         let client = HarborPlayClient()
 
         var credential: HarborPlayClient.Credential?

@@ -9,11 +9,9 @@ APP="${1:?usage: bundle_gplaydl.sh <BedrockHarbor.app>}"
 FW="$APP/Contents/Frameworks"
 BIN="$APP/Contents/MacOS"
 
-if [ ! -x "$SRC/build/gplaydl" ]; then
-  echo "Building gplaydl/gplayver from $SRC …"
-  cmake -B "$SRC/build" -S "$SRC" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/homebrew >/dev/null
-  cmake --build "$SRC/build" --target gplaydl gplayver -j8
-fi
+# Incremental builds pick up helper protocol fixes even when old binaries exist.
+cmake -B "$SRC/build" -S "$SRC" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/homebrew >/dev/null
+cmake --build "$SRC/build" --target gplaydl gplayver -j8
 test -x "$SRC/build/gplaydl" && test -x "$SRC/build/gplayver"
 
 mkdir -p "$FW" "$BIN"

@@ -31,19 +31,26 @@ public struct AccountsView: View {
         GroupBox("Google Play") {
             VStack(alignment: .leading, spacing: 12) {
                 LabeledContent(
-                    "Identity",
-                    value: app.isPlaySignedIn
-                        ? (app.playAccountLabel.isEmpty ? "Google Play" : app.playAccountLabel)
-                        : "Not signed in"
+                    "Status",
+                    value: app.playSession.status.label
                 )
+                if !app.playAccountLabel.isEmpty {
+                    LabeledContent("Account", value: app.playAccountLabel)
+                }
                 if app.isPlaySignedIn {
-                    Label("Downloads ready — the Play client can fetch Minecraft", systemImage: "checkmark.circle")
+                    Label("Google session verified. Game ownership is checked separately when downloading.", systemImage: "checkmark.circle")
                         .font(.caption)
                         .foregroundStyle(.green)
                 } else {
                     Text("Sign-in is only needed to download from Google Play. A Minecraft package already on this Mac plays without it.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                if case .unavailable(let reason) = app.playSession.status {
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
+                }
+                if let message = app.playSession.lastSignInMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
                 }
 
                 HStack(spacing: 12) {
@@ -56,12 +63,20 @@ public struct AccountsView: View {
                             Text("Sign in")
                         }
                     }
-                    .disabled(app.signInBusy)
+                    .disabled(app.signInBusy || app.isInstalling)
 
-                    Button("Sign in (fresh)") {
+                    Button("Use another account…") {
                         Task { await app.googleSignIn(fresh: true) }
                     }
-                    .disabled(app.signInBusy)
+                    .disabled(app.signInBusy || app.isInstalling)
+                    if case .unavailable = app.playSession.status {
+                        Button("Retry") { Task { await app.playSession.retry() } }
+                            .disabled(app.isInstalling)
+                    }
+                    if app.playSession.status != .signedOut {
+                        Button("Sign out") { Task { await app.googleSignOut() } }
+                            .disabled(app.playSession.status == .signingOut || app.isInstalling)
+                    }
                 }
             }
             .padding(4)

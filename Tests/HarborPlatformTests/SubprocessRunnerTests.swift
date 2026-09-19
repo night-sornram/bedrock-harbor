@@ -7,6 +7,21 @@ import Testing
 /// Uses only stock system binaries (/bin/echo, /bin/false, /bin/sleep, /bin/zsh).
 @Suite("HarborSubprocess runner")
 struct SubprocessRunnerTests {
+    @Test func cancellationTerminatesHelperAndThrowsCancellation() async throws {
+        let task = Task {
+            try await HarborSubprocess.run(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["30"])
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let start = ContinuousClock.now
+        task.cancel()
+        do {
+            _ = try await task.value
+            Issue.record("Cancelled helper returned success")
+        } catch is CancellationError {
+            #expect(ContinuousClock.now - start < .seconds(3))
+        }
+    }
+
     @Test func echoCapturesStdoutAndExitCode() async throws {
         let result = try await HarborSubprocess.run(
             executable: URL(fileURLWithPath: "/bin/echo"),

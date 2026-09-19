@@ -45,12 +45,14 @@ See [docs/FEASIBILITY_GATE.md](docs/FEASIBILITY_GATE.md).
 ## Build & test
 
 ```bash
-swift build
-# CommandLine Tools hosts Swift Testing macros under a non-default plugin path:
-swift test -Xswiftc -plugin-path -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ```
 
-With full Xcode, `swift test` should work without the extra plugin path.
+The complete test suite needs full Xcode for its XCTest targets. Account tests
+use isolated temporary stores and do not read or overwrite real user credentials.
+See [Google Play session status](docs/GOOGLE_PLAY_SESSION.md) for the authentication
+state model and helper protocol.
 
 Run the executable target (SPM host, not a signed `.app` yet):
 
@@ -58,10 +60,9 @@ Run the executable target (SPM host, not a signed `.app` yet):
 swift run BedrockHarbor
 ```
 
-Note: this machine has CommandLine Tools only (no full Xcode). SwiftUI `@State`
-macros are unavailable there, so the UI uses `@Observable` models and explicit
-`Binding` values. Packaging (`.app`, Sparkle, notarization) is a later milestone
-and typically needs Xcode + Developer ID credentials.
+The UI uses `@Observable` models and explicit `Binding` values. Packaging uses an
+optimized Release build and bundles the Google Play helpers. Distribution signing
+and notarization require Developer ID credentials.
 
 See `docs/ARCHITECTURE.md` and `docs/DEPENDENCY_POLICY.md`.
 

@@ -689,6 +689,14 @@ public enum HarborPlayTokenBridge {
         try? FileManager.default.removeItem(at: tokenFileURL)
     }
 
+    public static func clearSession() throws {
+        defaults.removeObject(forKey: "com.bedrockharbor.play.oauth")
+        defaults.removeObject(forKey: accountEmailKey)
+        if FileManager.default.fileExists(atPath: tokenFileURL.path) {
+            try FileManager.default.removeItem(at: tokenFileURL)
+        }
+    }
+
     public static func saveAccountEmail(_ email: String?) {
         guard let email = email?.trimmingCharacters(in: .whitespacesAndNewlines), email.contains("@") else { return }
         defaults.set(email, forKey: accountEmailKey)

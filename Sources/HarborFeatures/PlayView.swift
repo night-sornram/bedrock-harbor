@@ -90,12 +90,13 @@ public struct PlayView: View {
         VStack(alignment: .leading, spacing: 12) {
             StepRow(
                 n: 1,
-                title: "Sign in with Google Play",
-                subtitle: app.hasVerifiedGame
-                    ? "Optional — Minecraft is already on this Mac"
-                    : "Needed only to download from Google Play",
-                done: app.isPlaySignedIn || app.hasVerifiedGame,
-                active: app.nextStep == 1 && !app.hasVerifiedGame
+                title: app.googlePlayStepIsOptional ? "Google Play · optional" : "Google Play",
+                subtitle: app.googlePlayStepIsOptional
+                    ? "\(app.playSession.status.label) — you can play a local package without Google Play"
+                    : app.playSession.status.label,
+                done: app.googlePlayStepIsComplete,
+                active: app.nextStep == 1 && !app.googlePlayStepIsOptional,
+                optional: app.googlePlayStepIsOptional
             )
             StepRow(
                 n: 2,

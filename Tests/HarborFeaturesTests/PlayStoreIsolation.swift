@@ -28,6 +28,7 @@ enum PlayStoreIsolation {
         PlaySessionStore.homeOverride = url
         PlayCredentialBackup.urlOverride =
             url.appendingPathComponent(".bedrockharbor/credentials.json", isDirectory: false)
+        GPlayDLClient.workDirOverride = url.appendingPathComponent("PlayAPI", isDirectory: true)
         AppState.defaultsOverride = defaults
         return url
     }()
