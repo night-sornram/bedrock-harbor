@@ -26,11 +26,12 @@ public enum WindowAppearanceWatcher {
         Task.detached(priority: .utility) {
             let deadline = Date().addingTimeInterval(timeout)
             while Date() < deadline {
+                if Task.isCancelled { return }
                 if await targetWindowOnScreen(processName: processName, ownerPID: ownerPID) {
                     await recorder.mark(stage)
                     return
                 }
-                try? await Task.sleep(for: pollInterval)
+                do { try await Task.sleep(for: pollInterval) } catch { return }
             }
         }
     }

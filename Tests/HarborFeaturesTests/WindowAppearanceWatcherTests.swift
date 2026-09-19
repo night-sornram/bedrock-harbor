@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import Testing
+import HarborPlatform
 @testable import HarborFeatures
 
 @Suite("Window appearance watcher matching")
@@ -44,5 +45,28 @@ struct WindowAppearanceWatcherTests {
     @Test func plainIntPIDValueIsAccepted() {
         let info = [kCGWindowOwnerPID as String: Int32(4242)]
         #expect(WindowAppearanceWatcher.matchesOwner(info, pid: 4242, name: nil))
+    }
+
+    @Test func cancelledWatcherStopsPromptlyInsteadOfPollingToDeadline() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bh-watcher-cancel-\(UUID().uuidString)", isDirectory: true)
+        let recorder = LaunchTimingRecorder(directory: dir)
+
+        // PID -1 never owns a window, so without cancellation this watcher
+        // would keep polling CGWindowList until the full 10 s deadline.
+        let watchTask = WindowAppearanceWatcher.watch(
+            ownerPID: -1,
+            stage: .gameWindowVisible,
+            recorder: recorder,
+            timeout: 10
+        )
+        watchTask.cancel()
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        await watchTask.value
+        let elapsed = clock.now - start
+
+        #expect(elapsed < .seconds(5))
     }
 }
