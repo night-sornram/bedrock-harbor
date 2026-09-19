@@ -4,15 +4,21 @@ import HarborDomain
 
 final class CompatibilityPatchesTests: XCTestCase {
     private var tempDir: URL!
+    private var harborRoot: URL!
 
     override func setUp() {
         super.setUp()
         tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("HarborCompatTests-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        harborRoot = tempDir.appendingPathComponent("CompatibilityPatches", isDirectory: true)
+        HarborCompatibilityPatches.harborRootOverride = harborRoot
     }
 
     override func tearDown() {
+        HarborCompatibilityPatches.harborRootOverride = nil
+        HarborCompatibilityPatches.catalogLoader = nil
+        HarborCompatibilityPatches.now = { Date() }
         try? FileManager.default.removeItem(at: tempDir)
         super.tearDown()
     }
@@ -142,6 +148,155 @@ final class CompatibilityPatchesTests: XCTestCase {
                 latestAssetURL: "https://example.com/a.zip"
             )
         )
+    }
+
+    // MARK: - install / catalog refresh
+
+    /// Thread-safe invocation counter for the catalogLoader test hook.
+    private final class CallCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var value: Int {
+            lock.lock(); defer { lock.unlock() }
+            return count
+        }
+        func increment() {
+            lock.lock(); count += 1; lock.unlock()
+        }
+    }
+
+    /// Writes a valid install (metadata.json + executable mod .so) into the injected
+    /// harborRoot and returns the mod directory.
+    @discardableResult
+    private func writeInstalledPatch(
+        version: String = "1.26.45.1",
+        assetURL: String = "https://example.com/asset.zip",
+        names: [String] = ["1.26.45.1", "1.26.51.1"],
+        catalogCheckedAt: Date? = nil
+    ) throws -> URL {
+        let fm = FileManager.default
+        let modDir = harborRoot
+            .appendingPathComponent(version, isDirectory: true)
+            .appendingPathComponent("arm64-v8a", isDirectory: true)
+        try fm.createDirectory(at: modDir, withIntermediateDirectories: true)
+        let mod = modDir.appendingPathComponent(HarborCompatibilityPatches.modLibraryName)
+        try Data("fake-mod".utf8).write(to: mod)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mod.path)
+        let meta = HarborCompatibilityPatches.Metadata(
+            version: version,
+            assetURL: assetURL,
+            installPath: modDir.path,
+            supportedVersionCodes: [],
+            supportedVersionNames: names,
+            catalogCheckedAt: catalogCheckedAt
+        )
+        try JSONEncoder().encode(meta).write(to: harborRoot.appendingPathComponent("metadata.json"))
+        return modDir
+    }
+
+    /// Minimal moddb fixture with a single arm64 asset; mirrors the real catalog shape.
+    private func moddbData(
+        version: String = "1.26.45.1",
+        assetURL: String = "https://example.com/asset.zip"
+    ) -> Data {
+        Data(
+            """
+            [{"name":"mcpelauncher-updates","versions":[{"version":"\(version)",\
+            "assets":{"arm64-v8a":"\(assetURL)"},\
+            "extraVersions":[{"version_name":"1.26.45.1","codes":{"arm64-v8a":972605101}}]}]}]
+            """.utf8
+        )
+    }
+
+    /// Polls `condition` until true or timeout; yields the cooperative thread between checks.
+    private func waitUntil(
+        timeout: TimeInterval = 5,
+        _ condition: () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+
+    func testEnsureInstalledFastPathSkipsNetworkWhenCovered() async throws {
+        let modDir = try writeInstalledPatch(catalogCheckedAt: Date())
+        let counter = CallCounter()
+        let data = moddbData()
+        HarborCompatibilityPatches.catalogLoader = {
+            counter.increment()
+            return data
+        }
+
+        let started = Date()
+        let returned = try await HarborCompatibilityPatches.ensureInstalled(gameVersionName: "1.26.51.1")
+
+        XCTAssertEqual(returned, modDir)
+        XCTAssertEqual(counter.value, 0, "fast path must not consult the catalog")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3, "fast path must be offline-instant")
+    }
+
+    func testDailyCatalogRefreshGate() async throws {
+        let fixedNow = Date(timeIntervalSinceReferenceDate: 700_000_000)
+        HarborCompatibilityPatches.now = { fixedNow }
+        let modDir = try writeInstalledPatch(catalogCheckedAt: fixedNow.addingTimeInterval(-3600))
+        let counter = CallCounter()
+        let data = moddbData()
+        HarborCompatibilityPatches.catalogLoader = {
+            counter.increment()
+            return data
+        }
+
+        // Fresh stamp (1 h ago): no refresh at all.
+        _ = try await HarborCompatibilityPatches.ensureInstalled(gameVersionName: "1.26.51.1")
+        XCTAssertEqual(counter.value, 0)
+
+        // Stale stamp (25 h ago): background refresh fires exactly once and re-stamps.
+        try writeInstalledPatch(catalogCheckedAt: fixedNow.addingTimeInterval(-25 * 3600))
+        let returned = try await HarborCompatibilityPatches.ensureInstalled(gameVersionName: "1.26.51.1")
+        XCTAssertEqual(returned, modDir)
+        let refreshed = await waitUntil { counter.value == 1 }
+        XCTAssertTrue(refreshed, "stale catalog must trigger exactly one background refresh")
+        let restamped = await waitUntil {
+            guard let stamped = HarborCompatibilityPatches.loadMetadata()?.catalogCheckedAt else { return false }
+            return abs(stamped.timeIntervalSince(fixedNow)) < 1
+        }
+        XCTAssertTrue(restamped, "refresh must record a fresh catalogCheckedAt")
+
+        // After the re-stamp, the next launch must stay offline.
+        _ = try await HarborCompatibilityPatches.ensureInstalled(gameVersionName: "1.26.51.1")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(counter.value, 1, "refresh must run at most once per 24 h")
+    }
+
+    func testMetadataDecodesWithoutCatalogCheckedAt() throws {
+        let legacyJSON = """
+        {"version":"1.26.45.1","assetURL":"https://example.com/a.zip","installPath":"/tmp/x",\
+        "supportedVersionCodes":[972605101],"supportedVersionNames":["1.26.45.1"]}
+        """
+        let meta = try JSONDecoder().decode(
+            HarborCompatibilityPatches.Metadata.self,
+            from: Data(legacyJSON.utf8)
+        )
+        XCTAssertNil(meta.catalogCheckedAt)
+        XCTAssertEqual(meta.version, "1.26.45.1")
+    }
+
+    func testEnsureInstalledThrowsPromptlyWhenCatalogFetchStalls() async throws {
+        // No install present, loader simulating a stalled request that hit the bounded
+        // timeout: the error must propagate instead of hanging the launch path.
+        HarborCompatibilityPatches.catalogLoader = { throw URLError(.timedOut) }
+
+        let started = Date()
+        do {
+            _ = try await HarborCompatibilityPatches.ensureInstalled(gameVersionName: "1.26.51.1")
+            XCTFail("expected the stalled catalog fetch to throw")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .timedOut)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3)
     }
 
     // MARK: - known incompatibilities

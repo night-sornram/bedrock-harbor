@@ -29,6 +29,10 @@ public struct HarborCompatibilityPatches: Sendable {
         public var installPath: String
         public var supportedVersionCodes: [Int]
         public var supportedVersionNames: [String]
+        /// When the moddb catalog was last consulted. Optional so metadata.json files
+        /// written before daily refresh existed keep decoding (they decode as nil,
+        /// which counts as stale and triggers one background refresh).
+        public var catalogCheckedAt: Date? = nil
     }
 
     private struct ModDBEntry: Decodable {
@@ -62,10 +66,29 @@ public struct HarborCompatibilityPatches: Sendable {
         }
     }
 
+    /// Test seam: overrides the compat-patch storage root (nil in production).
+    nonisolated(unsafe) static var harborRootOverride: URL?
+
     public static var harborRoot: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        harborRootOverride ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/BedrockHarbor/CompatibilityPatches", isDirectory: true)
     }
+
+    /// Test seam: replaces the moddb network fetch (nil in production).
+    nonisolated(unsafe) static var catalogLoader: (@Sendable () async throws -> Data)?
+
+    /// Test seam: clock injection for the daily refresh gate.
+    nonisolated(unsafe) static var now: @Sendable () -> Date = { Date() }
+
+    /// Bounded-timeout session for all compat-patch network I/O: a stalled moddb fetch or
+    /// asset download fails in seconds instead of hanging the launch path for the
+    /// URLSession.shared defaults (multi-minute request timeout).
+    private static let timedSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 10
+        configuration.timeoutIntervalForResource = 180
+        return URLSession(configuration: configuration)
+    }()
 
     private static var metadataURL: URL {
         harborRoot.appendingPathComponent("metadata.json", isDirectory: false)
@@ -305,9 +328,15 @@ public struct HarborCompatibilityPatches: Sendable {
 
     /// Resolve the arm64 asset with the broadest game coverage from the public moddb.
     public static func resolveLatest() async throws -> (version: String, assetURL: URL, codes: [Int], names: [String]) {
-        let (data, response) = try await URLSession.shared.data(from: modDBURL)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw HarborError.providerFailure(reason: "moddb HTTP \(http.statusCode)")
+        let data: Data
+        if let catalogLoader {
+            data = try await catalogLoader()
+        } else {
+            let (fetched, response) = try await timedSession.data(from: modDBURL)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                throw HarborError.providerFailure(reason: "moddb HTTP \(http.statusCode)")
+            }
+            data = fetched
         }
         let entries = try JSONDecoder().decode([ModDBEntry].self, from: data)
         guard let entry = entries.first(where: { $0.name == modName }) else {
@@ -376,11 +405,74 @@ public struct HarborCompatibilityPatches: Sendable {
     }
 
     /// Download/extract the mod if needed and return its directory for `-m`.
-    /// Re-resolves moddb every launch and upgrades when upstream ships a different release
-    /// (the same asset URL is occasionally rebuilt with coverage for newer game versions).
-    /// When moddb is unreachable, falls back to the existing install.
+    /// Repeat launches are network-free: when the installed patch is intact and covers the
+    /// game version, it is returned immediately and the moddb catalog is refreshed at most
+    /// once a day in the background. A missing install, or a game version the installed
+    /// metadata does not cover, still resolves moddb synchronously so a newer release can
+    /// upgrade the install (or positively block the launch) before the game starts.
     @discardableResult
     public static func ensureInstalled(gameVersionName: String? = nil) async throws -> URL {
+        if let meta = loadMetadata(),
+           let installed = installedModDirectory(),
+           gameVersionName.map({ metadataSupports(meta, versionCode: nil, versionName: $0) }) ?? true {
+            if catalogNeedsRefresh(checkedAt: meta.catalogCheckedAt) {
+                refreshCatalogInBackground()
+            }
+            return installed
+        }
+        return try await resolveAndInstall(gameVersionName: gameVersionName)
+    }
+
+    /// Force a catalog refresh now: resolve moddb and install when the release differs
+    /// (wired to a Settings action). Unlike the background refresh, throws on failure.
+    @discardableResult
+    public static func refreshCatalogNow() async throws -> URL {
+        try await resolveAndInstall(gameVersionName: nil)
+    }
+
+    /// Minimum time between moddb consultations.
+    static let catalogRefreshInterval: TimeInterval = 24 * 60 * 60
+
+    /// The catalog must be consulted again when it never was, or more than a day ago.
+    static func catalogNeedsRefresh(checkedAt: Date?) -> Bool {
+        guard let checkedAt else { return true }
+        return now().timeIntervalSince(checkedAt) >= catalogRefreshInterval
+    }
+
+    /// Single-flight gate: at most one background catalog refresh runs per process.
+    private actor CatalogRefreshGate {
+        private var inFlight = false
+
+        /// Returns false when a refresh is already running.
+        func claim() -> Bool {
+            guard !inFlight else { return false }
+            inFlight = true
+            return true
+        }
+
+        func release() {
+            inFlight = false
+        }
+    }
+
+    private static let refreshGate = CatalogRefreshGate()
+
+    /// Fire-and-forget catalog refresh: resolves moddb and, when the release differs,
+    /// downloads + installs the update. At most one refresh runs per process; failures are
+    /// silent because the existing install keeps working.
+    static func refreshCatalogInBackground() {
+        Task.detached(priority: .utility) {
+            guard await refreshGate.claim() else { return }
+            _ = try? await resolveAndInstall(gameVersionName: nil)
+            await refreshGate.release()
+        }
+    }
+
+    /// Slow path shared by first install, uncovered game versions, and explicit refresh:
+    /// resolve moddb, reuse the existing install when possible, download + install when the
+    /// release differs, and stamp `catalogCheckedAt` so the daily refresh gate closes.
+    @discardableResult
+    private static func resolveAndInstall(gameVersionName: String?) async throws -> URL {
         let installedMeta = loadMetadata()
         let latest: (version: String, assetURL: URL, codes: [Int], names: [String])
         do {
@@ -403,6 +495,7 @@ public struct HarborCompatibilityPatches: Sendable {
                 latestVersion: latest.version,
                 latestAssetURL: latest.assetURL.absoluteString
             ) {
+                stampCatalogCheckedAt(meta)
                 return existing
             }
         }
@@ -417,7 +510,7 @@ public struct HarborCompatibilityPatches: Sendable {
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
-        let (downloaded, response) = try await URLSession.shared.download(from: latest.assetURL)
+        let (downloaded, response) = try await timedSession.download(from: latest.assetURL)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw HarborError.providerFailure(reason: "compat patch HTTP \(http.statusCode)")
         }
@@ -459,12 +552,22 @@ public struct HarborCompatibilityPatches: Sendable {
             assetURL: latest.assetURL.absoluteString,
             installPath: installPath.path,
             supportedVersionCodes: latest.codes,
-            supportedVersionNames: latest.names
+            supportedVersionNames: latest.names,
+            catalogCheckedAt: now()
         )
         if let data = try? JSONEncoder().encode(meta) {
             try? data.write(to: metadataURL, options: .atomic)
         }
         return installPath
+    }
+
+    /// Record that the moddb catalog was just consulted (closes the daily refresh gate).
+    private static func stampCatalogCheckedAt(_ meta: Metadata) {
+        var stamped = meta
+        stamped.catalogCheckedAt = now()
+        if let data = try? JSONEncoder().encode(stamped) {
+            try? data.write(to: metadataURL, options: .atomic)
+        }
     }
 
     // MARK: - Game package repair
