@@ -155,4 +155,52 @@ struct AppStateInstallGateTests {
         await liveApp.reload()
         #expect(liveApp.isPlaySignedIn, "oauth_token cookie in the bag is a real completed sign-in")
     }
+
+    /// Credentials must survive Application Support wipes — they live in a
+    /// chmod-600 dotfile in the user's home.
+    @Test func playCredentialBackupSurvivesOutsideAppSupport() {
+        let fm = FileManager.default
+        let url = fm.homeDirectoryForCurrentUser.appendingPathComponent(".bedrockharbor/credentials.json")
+        defer { try? fm.removeItem(at: url) }
+
+        PlayCredentialBackup.save(oauth: "oauth2_4/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", email: "a@gmail.com")
+        var payload = PlayCredentialBackup.load()
+        #expect(payload.oauth?.hasPrefix("oauth2_4/") == true)
+        #expect(payload.email == "a@gmail.com")
+
+        PlayCredentialBackup.save(master: "aas_et/MASTER")
+        payload = PlayCredentialBackup.load()
+        #expect(payload.master == "aas_et/MASTER", "master token added without dropping the oauth token")
+
+        PlayCredentialBackup.clearMaster()
+        payload = PlayCredentialBackup.load()
+        #expect(payload.master == nil && payload.oauth != nil, "clearMaster drops only the master token")
+    }
+
+    /// CLI auth priority: existing playdl.conf → backup master token →
+    /// sign-in access token → none (needs sign-in).
+    @Test func gplayAuthArgsPreferSavedConfThenMasterThenOauth() {
+        let viaConf = GPlayDLClient.authArgs(hasSavedConf: true, backupMaster: "m", backupEmail: "e@x.com", oauth: "o", email: "e@x.com")
+        #expect(viaConf.args == [] && !viaConf.usedBackupMaster)
+
+        let viaMaster = GPlayDLClient.authArgs(hasSavedConf: false, backupMaster: "m", backupEmail: "e@x.com", oauth: "o", email: "e@x.com")
+        #expect(viaMaster.args == ["--token", "m", "--email", "e@x.com", "--save-auth"] && viaMaster.usedBackupMaster)
+
+        let viaOauth = GPlayDLClient.authArgs(hasSavedConf: false, backupMaster: nil, backupEmail: nil, oauth: "o", email: nil)
+        #expect(viaOauth.args == ["--access-token", "o", "--email", "", "--save-auth"])
+
+        let none = GPlayDLClient.authArgs(hasSavedConf: false, backupMaster: nil, backupEmail: nil, oauth: nil, email: nil)
+        #expect(none.args == nil)
+    }
+
+    @Test func gplayProgressParsing() {
+        let full = GPlayDLClient.parseProgress("Downloaded 45% [400/886 MiB]")
+        #expect(full?.percent ?? 0 == 0.45)
+        #expect(full?.detail == "400/886 MiB")
+
+        let nearDone = GPlayDLClient.parseProgress("Downloaded 100% [886/886 MiB]")
+        #expect(nearDone?.percent ?? 0 == 1.0)
+
+        #expect(GPlayDLClient.parseProgress("Google Play: retrying version check…") == nil)
+    }
 }

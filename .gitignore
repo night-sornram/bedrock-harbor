@@ -35,3 +35,4 @@ DiagnosticsExport/
 .idea/
 .vscode/
 *.swp
+Vendor/Google-Play-API/build/

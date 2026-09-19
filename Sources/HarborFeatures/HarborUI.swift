@@ -101,6 +101,10 @@ public final class AppState {
     public var isGameRunning = false
     public var isInstalling = false
     public var signInBusy = false
+    /// Active download progress (0...1); nil when nothing measurable is downloading.
+    public var downloadProgress: Double?
+    public var downloadDetail = ""
+    public var downloadLabel = ""
     public var playAccountLabel = ""
     public var accounts: [AccountRecord] = []
     public var needsOnboarding = true
@@ -158,6 +162,10 @@ public final class AppState {
     public var isPlaySignedIn: Bool {
         if HarborPlayTokenBridge.loadOAuthToken() != nil { return true }
         if PlaySessionStore.load().cookies["oauth_token"] != nil { return true }
+        // Wipe-surviving credential backup (see PlayCredentialBackup) — after a
+        // data wipe the app is still truthfully signed in for downloads.
+        let backup = PlayCredentialBackup.load()
+        if backup.master != nil || backup.oauth != nil { return true }
         return accounts.contains { $0.sessionState == .ready && $0.accountLabel.contains("@") }
     }
 
@@ -250,6 +258,19 @@ public final class AppState {
         }
     }
 
+    /// Onboarding leads with "Sign in with Google Play", but a local package
+    /// (external launcher dirs, a prior install) makes login unnecessary —
+    /// scan once on entry so the screen reflects the real state instead of
+    /// demanding a login that is not needed to play.
+    public func autoDetectLocalPackage() async {
+        guard !hasVerifiedGame, !isInstalling else { return }
+        let result = await GamePackageAcquirer.acquire(services: services)
+        await reload()
+        if let install = result.installation {
+            status = "Minecraft \(install.originalVersionName) found on this Mac — no Google sign-in needed"
+        }
+    }
+
     public func resetSetup() {
         usedLocalAPK = false
         needsOnboarding = true
@@ -278,9 +299,18 @@ public final class AppState {
             return true
         }
         status = "Installing Minecraft Bedrock Launcher…"
+        defer { downloadProgress = nil }
+        downloadLabel = "Minecraft Bedrock Launcher"
         do {
             _ = try await HarborRuntimeInstaller.ensureInstalled(status: { text in
-                Task { @MainActor in self.status = text }
+                Task { @MainActor in
+                    self.status = text
+                    if let pctToken = text.range(of: #"\d+%"#, options: .regularExpression),
+                       let percent = Double(text[pctToken].dropLast()) {
+                        self.downloadProgress = percent / 100
+                        self.downloadDetail = ""
+                    }
+                }
             })
         } catch {
             status = "Minecraft Bedrock Launcher install failed: \(error.localizedDescription)"
@@ -384,8 +414,13 @@ public final class AppState {
     }
 
     public func installGame() async {
+        // A second concurrent run would start a duplicate ~1 GB download.
+        guard !isInstalling else { return }
         isInstalling = true
-        defer { isInstalling = false }
+        defer {
+            isInstalling = false
+            downloadProgress = nil
+        }
 
         // Prefer any package already on disk before Play network paths.
         let local = await GamePackageAcquirer.acquire(services: services)
@@ -452,6 +487,47 @@ public final class AppState {
             playAccountLabel = email
         } else if playAccountLabel.isEmpty || playAccountLabel == "Google Play account" {
             playAccountLabel = "Play user \(userID.prefix(8))…"
+        }
+
+        // Community Google-Play-API client first: Google's delivery gateway
+        // rejects Harbor's own client (HTTP 400) but accepts this one. First
+        // run exchanges the sign-in access token for a master token that
+        // gplaydl persists; later runs need no sign-in at all.
+        downloadLabel = "Minecraft"
+        if let gplay = await GPlayDLClient.download(
+            oauth: oauth,
+            email: email,
+            status: { self.status = $0 },
+            progress: { percent, detail in
+                self.downloadProgress = percent
+                self.downloadDetail = detail
+            }
+        ) {
+            do {
+                let dest = GamePackageAcquirer.harborInstallRoot()
+                    .appendingPathComponent(gplay.versionName, isDirectory: true)
+                try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+                if let extractor = findExtractor() {
+                    let process = Process()
+                    process.executableURL = extractor
+                    process.arguments = gplay.files.map(\.path) + [dest.path]
+                    try process.run()
+                    process.waitUntilExit()
+                    let install = try await GamePackageAcquirer.importIntoHarbor(from: dest, services: services)
+                    try? FileManager.default.removeItem(at: gplay.stagingDir)
+                    await reload()
+                    status = "Installed via Google-Play-API client — \(install.originalVersionName)"
+                    return
+                } else if let first = gplay.files.first {
+                    _ = try await GamePackageAcquirer.extractAPK(first, services: services)
+                    try? FileManager.default.removeItem(at: gplay.stagingDir)
+                    await reload()
+                    status = "Installed via Google-Play-API client"
+                    return
+                }
+            } catch {
+                status = "Google-Play-API install failed: \(error.localizedDescription) — trying Harbor client…"
+            }
         }
 
         let client = HarborPlayClient()
@@ -705,9 +781,11 @@ public struct OnboardingView: View {
                 StepRow(
                     n: 1,
                     title: "Sign in with Google Play",
-                    subtitle: "Required — account that owns Minecraft",
-                    done: app.isPlaySignedIn,
-                    active: app.nextStep == 1
+                    subtitle: app.hasVerifiedGame
+                        ? "Optional — Minecraft is already on this Mac"
+                        : "Needed only to download from Google Play",
+                    done: app.isPlaySignedIn || app.hasVerifiedGame,
+                    active: app.nextStep == 1 && !app.hasVerifiedGame
                 )
                 StepRow(
                     n: 2,
@@ -755,6 +833,14 @@ public struct OnboardingView: View {
             .buttonStyle(.link)
             .font(.caption)
 
+            if let pct = app.downloadProgress {
+                DownloadProgressCard(
+                    label: app.downloadLabel.isEmpty ? "Minecraft" : app.downloadLabel,
+                    progress: pct,
+                    detail: app.downloadDetail
+                )
+            }
+
             if !app.status.isEmpty {
                 Text(app.status)
                     .font(.callout)
@@ -763,7 +849,37 @@ public struct OnboardingView: View {
         }
         .padding(28)
         .frame(maxWidth: 560, maxHeight: .infinity, alignment: .topLeading)
-        .task { await app.reload() }
+        .task {
+            await app.reload()
+            await app.autoDetectLocalPackage()
+        }
+    }
+}
+
+// MARK: - Download progress
+
+struct DownloadProgressCard: View {
+    let label: String
+    let progress: Double
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Downloading \(label) — \(Int((progress * 100).rounded()))%")
+                    .font(.callout.weight(.medium))
+                Spacer()
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ProgressView(value: progress)
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -844,6 +960,15 @@ public struct HomeView: View {
                             }
                         }
                     }
+                }
+
+                // Download progress
+                if let pct = app.downloadProgress {
+                    DownloadProgressCard(
+                        label: app.downloadLabel.isEmpty ? "Minecraft" : app.downloadLabel,
+                        progress: pct,
+                        detail: app.downloadDetail
+                    )
                 }
 
                 // Status

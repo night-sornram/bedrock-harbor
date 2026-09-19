@@ -63,6 +63,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Community Google-Play-API CLI tools + their dylib closure (Play downloads)
+sh "$ROOT/Scripts/bundle_gplaydl.sh" "$APP"
+
 codesign --force --sign - --identifier "$ID" "$APP"
 xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 touch "$APP"

@@ -47,6 +47,14 @@ public final class GoogleSignInController {
             Task { @MainActor in
                 await Self.clearGoogleCookies(store: store)
             }
+        } else {
+            // WKWebView's store does not reliably persist between window/app
+            // sessions here — restore the harvested Google session ourselves
+            // so a re-opened window resumes the Android setup instead of
+            // asking for the password again.
+            Task { @MainActor in
+                await Self.restoreGoogleCookies(store: store)
+            }
         }
 
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 520, height: 560), configuration: config)
@@ -55,8 +63,8 @@ public final class GoogleSignInController {
         navigationBridge = bridge
         webView.navigationDelegate = bridge
         self.webView = webView
-        // Small delay on fresh login so cookies clear before first request.
-        let delay: TimeInterval = freshLogin ? 0.35 : 0
+        // Small delay so cookie restore/clear lands before the first request.
+        let delay: TimeInterval = 0.35
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.isPresented, !self.didFinish else { return }
             webView.load(URLRequest(url: Self.startURL))
@@ -137,6 +145,23 @@ public final class GoogleSignInController {
         PlaySessionStore.save(cookies: [:], email: nil)
     }
 
+    /// Put the persisted Google session back into the webview cookie store
+    /// (keyed by name only — the critical session cookies are all .google.com).
+    private static func restoreGoogleCookies(store: WKWebsiteDataStore) async {
+        let bag = PlaySessionStore.load().cookies
+        guard !bag.isEmpty else { return }
+        for (name, value) in bag where !name.hasPrefix("__Host") {
+            guard let cookie = HTTPCookie(properties: [
+                .domain: ".google.com",
+                .path: "/",
+                .name: name,
+                .value: value,
+                .secure: name.hasPrefix("__Secure"),
+            ]) else { continue }
+            await store.httpCookieStore.setCookie(cookie)
+        }
+    }
+
     private func startHarvestTimer() {
         harvestTimer?.invalidate()
         harvestTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
@@ -193,6 +218,7 @@ public final class GoogleSignInController {
         }
         if let oauth {
             HarborPlayTokenBridge.saveOAuthToken(oauth)
+            PlayCredentialBackup.save(oauth: oauth, email: email)
             capturedOAuthToken = true
             status = "Captured oauth_token (\(oauth.prefix(12))…)"
             refreshStatusLabels()
@@ -284,6 +310,7 @@ public final class GoogleSignInController {
             ?? PlaySessionStore.load().cookies["oauth_token"]
         if let token {
             HarborPlayTokenBridge.saveOAuthToken(token)
+            PlayCredentialBackup.save(oauth: token, email: resolvedEmail)
             capturedOAuthToken = true
         }
 
