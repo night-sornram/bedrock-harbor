@@ -392,7 +392,9 @@ public final class AppState {
             status = "Need Play client token (oauth_token) — open Android Google setup once"
             needsOnboarding = true
             refreshGate()
-            await googleSignIn(fresh: true)
+            // Not fresh on purpose: wiping the WKWebView session on every retry
+            // throws away the user's Google login and reads as bot-like churn.
+            await googleSignIn()
             auth = await PlaySessionStore.harvestFromWebKit(email: playAccountLabel.isEmpty ? nil : playAccountLabel)
             if auth.cookies.isEmpty { auth = PlaySessionStore.load() }
             oauth = HarborPlayTokenBridge.loadOAuthToken()
@@ -446,7 +448,7 @@ public final class AppState {
                 // Only re-login when we truly have no Play token. "Sign in again" is not the default.
                 if oauth == nil {
                     status = "No Play client token — opening Android Google setup once"
-                    await googleSignIn(fresh: true)
+                    await googleSignIn()
                     auth = PlaySessionStore.load()
                     oauth = HarborPlayTokenBridge.loadOAuthToken() ?? auth.cookies["oauth_token"]
                     if let oauth {

@@ -154,13 +154,9 @@ public final class GoogleSignInController {
         status = "Page: \(host.isEmpty ? url.absoluteString : host)"
         refreshStatusLabels()
 
-        if let token = HarborPlayTokenBridge.token(from: url) {
-            HarborPlayTokenBridge.saveOAuthToken(token)
-            capturedOAuthToken = true
-            status = "Captured Play token from URL"
-            refreshStatusLabels()
-        }
-
+        // URL params are not a completion signal: Google's setup flow can carry
+        // oauth_token-shaped params before login finishes. Only the oauth_token
+        // cookie (harvestAndroidSetupCookies) proves the setup completed.
         if host.contains("google.com") {
             Task { await self.harvestAndroidSetupCookies(); await self.scrapePageIdentity() }
         }
@@ -217,8 +213,9 @@ public final class GoogleSignInController {
         if !bag.isEmpty {
             PlaySessionStore.save(cookies: bag, email: email ?? signedInEmail)
         }
-        // Path A complete only with oauth_token. Email is preferred but not required.
-        if HarborPlayTokenBridge.loadOAuthToken() != nil || oauth != nil, !didFinish {
+        // Path A is complete ONLY when the oauth_token cookie was harvested —
+        // not when any token-shaped value appeared in a URL or the page.
+        if oauth != nil, !didFinish {
             finish(email: email ?? signedInEmail, userInitiated: false)
         }
     }
@@ -250,10 +247,8 @@ public final class GoogleSignInController {
         """
         let result = try? await webView.evaluateJavaScript(js)
         if let dict = result as? [String: Any] {
-            if let token = dict["token"] as? String, !token.isEmpty {
-                HarborPlayTokenBridge.saveOAuthToken(token)
-                capturedOAuthToken = true
-            }
+            // Email only — tokens scraped from page content are not trustworthy
+            // completion signals; only the oauth_token cookie is.
             if let email = dict["email"] as? String, email.contains("@") {
                 signedInEmail = email
                 HarborPlayTokenBridge.saveAccountEmail(email)
@@ -262,12 +257,6 @@ public final class GoogleSignInController {
         } else if let email = result as? String, email.contains("@") {
             signedInEmail = email
             HarborPlayTokenBridge.saveAccountEmail(email)
-        }
-        if HarborPlayTokenBridge.loadOAuthToken() != nil {
-            capturedOAuthToken = true
-            if !didFinish {
-                finish(email: signedInEmail, userInitiated: false)
-            }
         }
         refreshStatusLabels()
     }
