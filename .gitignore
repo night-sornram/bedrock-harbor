@@ -36,3 +36,4 @@ DiagnosticsExport/
 .vscode/
 *.swp
 Vendor/Google-Play-API/build/
+.superpowers/

@@ -37,8 +37,13 @@ final class AppBootstrap {
                         launcher: launcher,
                         timing: timing
                     )
+                    // The appStart session is otherwise never ended — close it
+                    // now (kind-guarded: a game launch that started during
+                    // bootstrap owns the recorder by now and must not be cut).
+                    await timing.end(kind: "appStart", outcome: "ok")
                 } catch {
                     bootstrapNote = error.localizedDescription
+                    await timing.end(kind: "appStart", outcome: "failed")
                 }
                 // The UI's first metadata read races this bootstrap (it can download
                 // the runtime for ~40 s) — tell it to re-read state now that the

@@ -120,6 +120,15 @@ public actor LaunchTimingRecorder {
         persist(record)
     }
 
+    /// Ends the in-flight session only when it is still `kind`. The recorder
+    /// tracks one session at a time, so a game launch that started while the
+    /// appStart session was open has already replaced it — ending "appStart"
+    /// then must not cut the launch session short.
+    public func end(kind: String, outcome: String) {
+        guard current?.kind == kind else { return }
+        end(outcome: outcome)
+    }
+
     /// Reads the persisted JSONL records (oldest first). Empty when absent or unreadable.
     public static func recentRecords(directory: URL) -> [LaunchTimingRecord] {
         let url = directory.appendingPathComponent(fileName)

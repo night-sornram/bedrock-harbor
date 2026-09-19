@@ -67,6 +67,7 @@ public struct StepRow: View {
                     Image(systemName: "checkmark")
                         .font(.caption.bold())
                         .foregroundStyle(.white)
+                        .accessibilityLabel("Done")
                 } else {
                     Text("\(n)").font(.caption.bold())
                         .foregroundStyle(active ? .white : .secondary)
@@ -78,6 +79,73 @@ public struct StepRow: View {
             }
             Spacer()
         }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - Operation phase surface
+
+/// Renders an `OperationTracker` phase: spinner + stage label while working,
+/// green completion text when done, short failure text plus a recovery button
+/// when failed. Standard controls only — no custom animation.
+struct OperationPhaseView: View {
+    let tracker: OperationTracker
+    let onRecovery: (OperationTracker.Recovery) -> Void
+
+    var body: some View {
+        switch tracker.phase {
+        case .idle:
+            EmptyView()
+        case .working(let label):
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(label)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        case .done(let message):
+            Label(message, systemImage: "checkmark.circle")
+                .font(.callout)
+                .foregroundStyle(.green)
+        case .failed(let message, let recovery):
+            VStack(alignment: .leading, spacing: 8) {
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                if let recovery {
+                    Button(recovery.title) { onRecovery(recovery) }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Download progress
+
+struct DownloadProgressCard: View {
+    let label: String
+    let progress: Double
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Downloading \(label) — \(Int((progress * 100).rounded()))%")
+                    .font(.callout.weight(.medium))
+                Spacer()
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ProgressView(value: progress)
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -85,7 +153,7 @@ public struct StepRow: View {
 
 /// Posted once the startup bootstrap (runtime self-heal, metadata repair, package
 /// acquisition) has finished — it can run for ~40 s after a data wipe, well past
-/// the UI's first metadata read. AppState reloads on it so the Home screen cannot
+/// the UI's first metadata read. AppState reloads on it so the Play screen cannot
 /// stay stuck on the "Install" step for an already-installed game.
 extension Notification.Name {
     public static let harborBootstrapFinished = Notification.Name("com.bedrockharbor.bootstrap.finished")
@@ -98,18 +166,20 @@ public final class AppState {
     public var installations: [InstalledMinecraft] = []
     public var runtimes: [RuntimeInstallation] = []
     public var selectedProfileID: UUID?
-    public var status: String = ""
     public var isGameRunning = false
     public var isInstalling = false
     public var signInBusy = false
     /// Active download progress (0...1); nil when nothing measurable is downloading.
+    /// Percentages are shown for downloads only — launch stages are named, not faked.
     public var downloadProgress: Double?
     public var downloadDetail = ""
     public var downloadLabel = ""
     public var playAccountLabel = ""
     public var accounts: [AccountRecord] = []
+    /// Internal first-run hint. Never gates navigation — the app always opens on
+    /// Play; the readiness checklist there shows what is missing instead.
     public var needsOnboarding = true
-    public var doctorLines: [String] = []
+    public var doctorFindings: [DoctorFinding] = []
 
     // Derived snapshot: these used to be computed properties that hit the
     // filesystem, the Keychain/token bridge, and UserDefaults on every SwiftUI
@@ -120,6 +190,26 @@ public final class AppState {
     public var runtime: RuntimeInstallation?
     public var hasVerifiedGame = false
     public var isPlaySignedIn = false
+    /// Snapshot of the "user plays from a local package" default (Task 6
+    /// pattern): written via `useLocalAPK()` / `resetSetup()`, read from
+    // UserDefaults only inside `refreshDerivedState()` — never per render.
+    public private(set) var usedLocalAPK = false
+
+    // Structured operation state (replaces the old status string): one tracker
+    // per UI concern so sections never overwrite each other's phases.
+    public let playOperations = OperationTracker()
+    public let installOperations = OperationTracker()
+    public let accountOperations = OperationTracker()
+    public let maintenanceOperations = OperationTracker()
+    public let diagnosticsOperations = OperationTracker()
+
+    /// Live launch stages, driven by the supervisor's RuntimeEvent stream.
+    public let launchProgress = LaunchProgressTracker()
+    /// Local mirror of the coordinator's launch reservation: true from the
+    /// moment a launch begins (before its first suspension) until a terminal
+    /// RuntimeEvent resets it — so Play auto-restores after exit or failure.
+    public internal(set) var launchInFlight = false
+    private var cancelLaunchRequested = false
 
     public let services: HarborServiceBundle
     private var sessionCoordinator: GameSessionCoordinator?
@@ -159,11 +249,12 @@ public final class AppState {
     }
 
     /// Recomputes the derived snapshot (gameInstallation, runtime,
-    /// hasVerifiedGame, isPlaySignedIn) from the freshly loaded arrays and the
-    /// credential stores. Runs inside `reload()` and after mutating actions —
-    /// never from a SwiftUI `body`.
+    /// hasVerifiedGame, isPlaySignedIn, usedLocalAPK) from the freshly loaded
+    /// arrays and the credential stores. Runs inside `reload()` and after
+    /// mutating actions — never from a SwiftUI `body`.
     func refreshDerivedState() {
         let profile = selectedProfile
+        usedLocalAPK = UserDefaults.standard.bool(forKey: Self.localAPKKey)
 
         // gameInstallation honors the profile: its selected install first,
         // then first verified, then first.
@@ -218,14 +309,10 @@ public final class AppState {
         return 1
     }
 
-    public var usedLocalAPK: Bool {
-        get { UserDefaults.standard.bool(forKey: Self.localAPKKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Self.localAPKKey) }
-    }
-
     public func refreshGate() {
-        // A verified local game package is enough to play — Google Play sign-in is only
-        // needed for store features, never for launching an installed package.
+        // Internal hint only: a verified local game package is enough to play —
+        // Google Play sign-in is only needed for store features. Nothing in the
+        // UI is gated on this anymore.
         if isPlaySignedIn || usedLocalAPK || hasVerifiedGame {
             needsOnboarding = false
         } else {
@@ -245,7 +332,6 @@ public final class AppState {
         if selectedProfileID == nil { selectedProfileID = profiles.first?.id }
         refreshDerivedState()
         refreshGate()
-        status = status.isEmpty ? readySummary() : status
     }
 
     /// A stored Play token sitting on an anonymous cookie bag (no oauth_token
@@ -270,12 +356,6 @@ public final class AppState {
         playAccountLabel = ""
     }
 
-    private func readySummary() -> String {
-        if !isPlaySignedIn && !usedLocalAPK { return "Step 1 — Sign in with Google Play" }
-        if !hasVerifiedGame { return "Step 2 — Install Minecraft" }
-        return "Step 3 — Launch"
-    }
-
     public func completeOnboardingFromLogin() {
         needsOnboarding = false
         UserDefaults.standard.set(true, forKey: Self.onboardKey)
@@ -283,52 +363,47 @@ public final class AppState {
     }
 
     public func useLocalAPK() {
+        UserDefaults.standard.set(true, forKey: Self.localAPKKey)
         usedLocalAPK = true
         needsOnboarding = false
-        status = "Local package mode — Install from APK / folder… or Rescan packages"
+        installOperations.succeed("Local package mode — Install from APK / folder… or Rescan packages")
         refreshDerivedState()
         refreshGate()
     }
 
     public func rescanPackages() async {
+        guard !isInstalling else { return }
         isInstalling = true
         defer { isInstalling = false }
-        status = "Scanning for Minecraft packages…"
+        installOperations.begin("Scanning for Minecraft packages…")
+        // Explicit user action: full scope (Downloads/Desktop/other launchers).
         let result = await GamePackageAcquirer.acquire(services: services)
         await reload()
         if let install = result.installation {
-            status = "Package ready: \(install.originalVersionName) — Launch"
+            installOperations.succeed("Package ready: \(install.originalVersionName) — back to Play")
         } else {
-            status = "No Minecraft package found. Use Install Minecraft (downloads from Google Play), or Install from APK / folder…"
-        }
-    }
-
-    /// Onboarding leads with "Sign in with Google Play", but a local package
-    /// (external launcher dirs, a prior install) makes login unnecessary —
-    /// scan once on entry so the screen reflects the real state instead of
-    /// demanding a login that is not needed to play.
-    public func autoDetectLocalPackage() async {
-        guard !hasVerifiedGame, !isInstalling else { return }
-        let result = await GamePackageAcquirer.acquire(services: services)
-        await reload()
-        if let install = result.installation {
-            status = "Minecraft \(install.originalVersionName) found on this Mac — no Google sign-in needed"
+            installOperations.fail("No Minecraft package found on this Mac.", recovery: .installGame)
         }
     }
 
     public func resetSetup() {
+        UserDefaults.standard.set(false, forKey: Self.localAPKKey)
         usedLocalAPK = false
         needsOnboarding = true
         UserDefaults.standard.set(false, forKey: Self.onboardKey)
+        refreshDerivedState()
         refreshGate()
+        maintenanceOperations.succeed("Setup reset — the readiness checklist on Play shows what is missing")
     }
 
     // MARK: Actions
 
     /// The Minecraft Bedrock Launcher runtime ships mcpelauncher-extract + mcpelauncher-client.
     /// When it is missing (fresh Mac, wiped data) Harbor installs it automatically —
-    /// no manual script step.
-    public func ensureLauncherRuntimeInstalled() async -> Bool {
+    /// no manual script step. Phase/progress updates go to `tracker` so callers
+    /// (Play self-heal, install, import) surface them on their own screen.
+    @discardableResult
+    public func ensureLauncherRuntimeInstalled(tracker: OperationTracker) async -> Bool {
         if HarborRuntimeInstaller.runtimePresent() {
             // Runtime is on disk — but if metadata lost the record (startup race,
             // wiped metadata), repair it so Launch and the step list don't act as
@@ -343,13 +418,13 @@ public final class AppState {
             }
             return true
         }
-        status = "Installing Minecraft Bedrock Launcher…"
+        tracker.begin("Installing Minecraft Bedrock Launcher…")
         defer { downloadProgress = nil }
         downloadLabel = "Minecraft Bedrock Launcher"
         do {
             _ = try await HarborRuntimeInstaller.ensureInstalled(status: { text in
                 Task { @MainActor in
-                    self.status = text
+                    tracker.begin(text)
                     if let pctToken = text.range(of: #"\d+%"#, options: .regularExpression),
                        let percent = Double(text[pctToken].dropLast()) {
                         self.downloadProgress = percent / 100
@@ -358,12 +433,15 @@ public final class AppState {
                 }
             })
         } catch {
-            status = "Minecraft Bedrock Launcher install failed: \(error.localizedDescription)"
+            tracker.fail(
+                "Launcher runtime install failed: \(OperationTracker.shortMessage(for: error))",
+                recovery: .reinstallRuntime
+            )
             return false
         }
         // Persist the freshly installed runtime so Launch works in this same session.
         guard let bundle = LocalRuntimeDiscovery().discoverDefault() else {
-            status = "Minecraft Bedrock Launcher installed but not detected — restart Harbor"
+            tracker.fail("Launcher runtime installed but not detected — restart Harbor.", recovery: .openSettings)
             return false
         }
         var runtimes = (try? await services.metadata.loadRuntimeInstallations()) ?? []
@@ -374,7 +452,7 @@ public final class AppState {
         }
         try? await services.metadata.saveRuntimeInstallations(runtimes)
         await reload()
-        status = "Minecraft Bedrock Launcher installed — continuing…"
+        tracker.begin("Launcher runtime installed — continuing…")
         return true
     }
 
@@ -397,7 +475,8 @@ public final class AppState {
 
     public func googleSignIn(fresh: Bool = false) async {
         signInBusy = true
-        status = fresh ? "Opening Google sign-in (fresh Android setup)…" : "Opening Google sign-in…"
+        defer { signInBusy = false }
+        accountOperations.begin(fresh ? "Opening Google sign-in (fresh Android setup)…" : "Opening Google sign-in…")
         GoogleSignInController.shared.present(freshLogin: fresh)
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             let once = ResumeOnce()
@@ -445,16 +524,21 @@ public final class AppState {
             try? await services.metadata.saveAccounts(accounts)
             if oauth != nil {
                 completeOnboardingFromLogin()
-                status = "Play token ready (\(playAccountLabel)) — next: Install Minecraft"
+                accountOperations.succeed("Play token ready (\(playAccountLabel)) — next: Install Minecraft")
             } else {
-                status = "Signed in as \(playAccountLabel), but oauth_token missing — open Android setup once more"
+                accountOperations.fail(
+                    "Signed in as \(playAccountLabel), but oauth_token missing — open Android setup once more.",
+                    recovery: .signInFresh
+                )
                 needsOnboarding = true
                 refreshGate()
             }
         } else {
-            status = "Google sign-in not finished — complete Android setup until status shows oauth_token"
+            accountOperations.fail(
+                "Google sign-in not finished — complete Android setup until status shows oauth_token.",
+                recovery: .signIn
+            )
         }
-        signInBusy = false
         await reload()
     }
 
@@ -468,17 +552,18 @@ public final class AppState {
         }
 
         // Prefer any package already on disk before Play network paths.
-        let local = await GamePackageAcquirer.acquire(services: services)
+        installOperations.begin("Looking for a package already on this Mac…")
+        let local = await GamePackageAcquirer.acquire(services: services, scope: .startup)
         if let existing = local.installation, existing.integrity == .verified {
             await reload()
-            status = "Minecraft \(existing.originalVersionName) ready — Launch"
+            installOperations.succeed("Minecraft \(existing.originalVersionName) ready — back to Play")
             return
         }
 
         // APK extraction needs mcpelauncher-extract — install the launcher runtime first.
-        guard await ensureLauncherRuntimeInstalled() else { return }
+        guard await ensureLauncherRuntimeInstalled(tracker: installOperations) else { return }
 
-        status = "Checking Google Play session…"
+        installOperations.begin("Checking Google Play session…")
         var auth = await PlaySessionStore.harvestFromWebKit(email: playAccountLabel.isEmpty ? nil : playAccountLabel)
         if auth.cookies.isEmpty {
             auth = PlaySessionStore.load()
@@ -492,7 +577,7 @@ public final class AppState {
 
         // Path A requires Android setup oauth_token — not only website cookies.
         if oauth == nil {
-            status = "Need Play client token (oauth_token) — open Android Google setup once"
+            installOperations.fail("Need a Play client token (oauth_token) — opening Google sign-in once.", recovery: .signIn)
             needsOnboarding = true
             refreshGate()
             // Not fresh on purpose: wiping the WKWebView session on every retry
@@ -503,7 +588,10 @@ public final class AppState {
             oauth = HarborPlayTokenBridge.loadOAuthToken()
             if oauth == nil { oauth = auth.cookies["oauth_token"] }
             if oauth == nil {
-                status = "oauth_token not captured yet. In the Google window finish Android setup (I agree) until status shows oauth_token, then Install again."
+                installOperations.fail(
+                    "oauth_token not captured yet. In the Google window finish Android setup (I agree) until it shows oauth_token, then Install again.",
+                    recovery: .signIn
+                )
                 return
             }
         }
@@ -522,11 +610,11 @@ public final class AppState {
         if email == nil || playAccountLabel == "Google Play account" || playAccountLabel.isEmpty {
             let listing = await PlayStoreInspector().inspect(auth: auth)
             if let e = listing.accountEmail { email = e; HarborPlayTokenBridge.saveAccountEmail(e) }
-            status = "Play client token ready. \(listing.summary)"
+            installOperations.begin("Play client token ready. \(listing.summary)")
         } else if let email {
-            status = "Signed in as \(email) — installing with Harbor Play client…"
+            installOperations.begin("Signed in as \(email) — installing with Harbor Play client…")
         } else {
-            status = "Play client token ready — installing with Harbor Play client…"
+            installOperations.begin("Play client token ready — installing with Harbor Play client…")
         }
         if let email, email.contains("@") {
             playAccountLabel = email
@@ -542,7 +630,7 @@ public final class AppState {
         if let gplay = await GPlayDLClient.download(
             oauth: oauth,
             email: email,
-            status: { self.status = $0 },
+            status: { self.installOperations.begin($0) },
             progress: { percent, detail in
                 self.downloadProgress = percent
                 self.downloadDetail = detail
@@ -563,17 +651,17 @@ public final class AppState {
                     let install = try await GamePackageAcquirer.importIntoHarbor(from: dest, services: services)
                     try? FileManager.default.removeItem(at: gplay.stagingDir)
                     await reload()
-                    status = "Installed via Google-Play-API client — \(install.originalVersionName)"
+                    installOperations.succeed("Installed via Google-Play-API client — \(install.originalVersionName)")
                     return
                 } else if let first = gplay.files.first {
                     _ = try await GamePackageAcquirer.extractAPK(first, services: services)
                     try? FileManager.default.removeItem(at: gplay.stagingDir)
                     await reload()
-                    status = "Installed via Google-Play-API client"
+                    installOperations.succeed("Installed via Google-Play-API client")
                     return
                 }
             } catch {
-                status = "Google-Play-API install failed: \(error.localizedDescription) — trying Harbor client…"
+                installOperations.begin("Google-Play-API install failed: \(OperationTracker.shortMessage(for: error)) — trying Harbor client…")
             }
         }
 
@@ -587,13 +675,13 @@ public final class AppState {
                 userID: userID,
                 cookieSession: auth
             )
-            status = "Play client authorized — downloading…"
+            installOperations.begin("Play client authorized — downloading…")
         } catch let error as HarborError {
             switch error {
             case .reauthenticationRequired:
                 // Only re-login when we truly have no Play token. "Sign in again" is not the default.
                 if oauth == nil {
-                    status = "No Play client token — opening Android Google setup once"
+                    installOperations.fail("No Play client token — opening Android Google setup once.", recovery: .signIn)
                     await googleSignIn()
                     auth = PlaySessionStore.load()
                     oauth = HarborPlayTokenBridge.loadOAuthToken() ?? auth.cookies["oauth_token"]
@@ -605,24 +693,30 @@ public final class AppState {
                             cookieSession: auth
                         )
                     } else {
-                        status = "oauth_token still missing. Settings → Sign in again (fresh), finish Android setup until status shows oauth_token."
+                        installOperations.fail(
+                            "oauth_token still missing. Accounts → Sign in again (fresh), finish Android setup until it shows oauth_token.",
+                            recovery: .signInFresh
+                        )
                     }
                 } else {
-                    status = "Play token exists; Google still rejected auth. Do not sign in again — token exchange failed."
+                    installOperations.fail("Play token exists; Google still rejected auth — token exchange failed. Do not sign in again.")
                 }
             case .providerFailure(let reason):
-                status = "\(reason) — if oauth_token is already captured, do not Sign in again; try Settings → fresh setup only when token is missing, or Install from APK."
+                installOperations.fail(
+                    "\(reason) — if oauth_token is already captured, do not Sign in again; use a fresh setup only when the token is missing, or Import from APK.",
+                    recovery: .importPackage
+                )
             default:
-                status = error.localizedDescription
+                installOperations.fail(OperationTracker.shortMessage(for: error), recovery: OperationTracker.recovery(for: error))
             }
         } catch {
-            status = error.localizedDescription
+            installOperations.fail(OperationTracker.shortMessage(for: error))
         }
 
         if let credential {
             do {
                 let version = try await client.latestVersion(credential: credential)
-                status = "Play version \(version.versionName ?? String(version.versionCode)) — downloading…"
+                installOperations.begin("Play version \(version.versionName ?? String(version.versionCode)) — downloading…")
                 let staging = services.paths.stagingCache
                     .appendingPathComponent("harbor-play-\(UUID().uuidString)", isDirectory: true)
                 let files = try await client.downloadDelivery(
@@ -630,7 +724,7 @@ public final class AppState {
                     credential: credential,
                     outputDirectory: staging
                 )
-                status = "Downloaded \(files.count) APK file(s) — installing…"
+                installOperations.begin("Downloaded \(files.count) APK file(s) — installing…")
                 let versionName = version.versionName ?? "play-\(version.versionCode)"
                 let dest = GamePackageAcquirer.harborInstallRoot().appendingPathComponent(versionName, isDirectory: true)
                 try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
@@ -645,57 +739,47 @@ public final class AppState {
                 } else {
                     _ = try await GamePackageAcquirer.extractAPK(files[0].fileURL, services: services)
                     await reload()
-                    status = "Installed via Harbor Play client"
+                    installOperations.succeed("Installed via Harbor Play client")
                     return
                 }
                 let install = try await GamePackageAcquirer.importIntoHarbor(from: dest, services: services)
                 await reload()
-                status = "Installed via Harbor Play client — \(install.originalVersionName)"
+                installOperations.succeed("Installed via Harbor Play client — \(install.originalVersionName)")
                 return
             } catch {
-                status = "Harbor Play download failed: \(error.localizedDescription)"
+                installOperations.fail("Harbor Play download failed: \(OperationTracker.shortMessage(for: error))", recovery: .rescan)
                 return
             }
         }
 
         // Signed-in fallback: cookie-based Play probe (does not require another login).
-        status = "Trying Play download with existing session…"
+        installOperations.begin("Trying Play download with existing session…")
         do {
             let staging = services.paths.stagingCache
                 .appendingPathComponent("play-web-\(UUID().uuidString)", isDirectory: true)
             let result = try await PlayDeliveryClient().downloadPackage(auth: auth, into: staging)
-            status = "Play session download complete (\(result.fileCount)) — installing…"
+            installOperations.begin("Play session download complete (\(result.fileCount)) — installing…")
             let apks = ((try? FileManager.default.contentsOfDirectory(at: result.packageDirectory, includingPropertiesForKeys: nil)) ?? [])
                 .filter { $0.pathExtension.lowercased() == "apk" }
             if let first = apks.first {
                 _ = try await GamePackageAcquirer.extractAPK(first, services: services)
                 await reload()
-                status = "Installed from Play session download"
+                installOperations.succeed("Installed from Play session download")
             } else {
-                status = Self.packageNeededMessage(details: "Play returned no APK files")
+                installOperations.fail("Play returned no APK files.", recovery: .importPackage)
             }
         } catch {
-            status = Self.packageNeededMessage(details: error.localizedDescription)
+            installOperations.fail(
+                "Google Play did not deliver Minecraft — check that your account owns it, run setup again, or import an owned APK. (\(OperationTracker.shortMessage(for: error)))",
+                recovery: .importPackage
+            )
         }
         await reload()
     }
 
-    /// Clear UX when Google will not hand APKs to Harbor.
-    private static func packageNeededMessage(details: String) -> String {
-        """
-        Harbor could not download Minecraft from Google Play this time.\n\n\
-        Things to check:\n\
-        1) The signed-in Google account owns Minecraft on Play\n\
-        2) Run setup again, then Install — a fresh Play token often fixes it\n\
-        3) Home → Install from APK / folder… (owned base.apk or game folder with lib/arm64-v8a/libminecraftpe.so)\n\n\
-        Play login can still be real. This is Google delivery policy, not a Harbor account bug.\n\n\
-        Detail: \(details)
-        """
-    }
-
     public func openPlayStoreListing() {
         NSWorkspace.shared.open(PlayStoreInspector.detailsURL)
-        status = "Opened Minecraft on Google Play — you can install to an Android device from there"
+        installOperations.succeed("Opened Minecraft on Google Play — you can install to an Android device from there")
     }
 
     private func findExtractor() -> URL? {
@@ -717,90 +801,203 @@ public final class AppState {
         panel.message = "Select Minecraft .apk or a folder with lib/arm64-v8a/libminecraftpe.so"
         panel.prompt = "Install"
         guard panel.runModal() == .OK, let url = panel.url else {
-            status = "Install cancelled"
+            installOperations.reset()
             return
         }
         let services = self.services
         Task {
+            installOperations.begin("Installing \(url.lastPathComponent)…")
             do {
                 let install: InstalledMinecraft
                 if url.pathExtension.lowercased() == "apk" {
-                    guard await self.ensureLauncherRuntimeInstalled() else { return }
+                    guard await self.ensureLauncherRuntimeInstalled(tracker: installOperations) else { return }
                     install = try await GamePackageAcquirer.extractAPK(url, services: services)
                 } else {
                     install = try await GamePackageAcquirer.importIntoHarbor(from: url, services: services)
                 }
                 await reload()
-                status = "Installed \(install.originalVersionName)"
+                installOperations.succeed("Installed \(install.originalVersionName)")
             } catch {
-                status = error.localizedDescription
+                installOperations.fail(
+                    "Import failed: \(OperationTracker.shortMessage(for: error))",
+                    recovery: OperationTracker.recovery(for: error)
+                )
             }
         }
     }
 
+    /// Makes the profile's selected installation the one Play launches.
+    public func selectInstallation(_ installation: InstalledMinecraft) async {
+        guard var profile = selectedProfile,
+              profile.selectedInstallationID != installation.id
+        else { return }
+        profile.selectedInstallationID = installation.id
+        do {
+            try await ProfileWorkflow(services: services).update(profile)
+        } catch {
+            installOperations.fail("Could not select installation: \(OperationTracker.shortMessage(for: error))")
+            return
+        }
+        await reload()
+        installOperations.succeed("Profile “\(profile.name)” now uses \(installation.originalVersionName)")
+    }
+
+    // MARK: Launch
+
     public func launchGame() async {
         if nextStep == 1 && !usedLocalAPK {
-            status = "Step 1 required — Sign in with Google Play"
+            playOperations.fail("Sign in with Google Play first — or import a package you already own.", recovery: .signIn)
             return
         }
         if !hasVerifiedGame {
             await installGame()
             guard hasVerifiedGame else {
-                status = "Cannot launch — Minecraft package missing"
+                playOperations.fail("Minecraft is not installed yet.", recovery: .installGame)
                 return
             }
         }
-        if runtime == nil {
-            // Last-resort self-heal (startup install may have failed while offline).
-            guard await ensureLauncherRuntimeInstalled() else { return }
-        }
+        guard !launchInFlight, !isGameRunning else { return }
+        cancelLaunchRequested = false
+        // Local mirror of the coordinator's reservation: Play is disabled from
+        // this moment — before the first suspension below — until a terminal
+        // RuntimeEvent restores it.
+        launchInFlight = true
+        launchProgress.begin(.verifyingPackage)
+        playOperations.begin(LaunchProgress.verifyingPackage.label)
         guard let profile = selectedProfile,
-              let installation = gameInstallation,
-              let runtime
+              let installation = gameInstallation
         else {
-            status = "Missing profile, game, or runtime"
+            launchInFlight = false
+            launchProgress.clear()
+            playOperations.fail("Missing profile or game installation.", recovery: .openSettings)
             return
         }
-        let coordinator = sessionCoordinator ?? GameSessionCoordinator(services: services)
-        sessionCoordinator = coordinator
         do {
             let verified = try await GameSessionCoordinator.verifyInstallation(installation, services: services)
+            try throwIfCancelled()
             guard verified.integrity == .verified else {
-                status = "Game package not verified"
-                return
+                throw HarborError.invalidPackage(
+                    reason: "Game package not verified under \(installation.relativeGameDirectory)"
+                )
             }
+            if runtime == nil {
+                // Last-resort self-heal (startup install may have failed while offline).
+                launchProgress.begin(.checkingRuntime)
+                playOperations.begin(LaunchProgress.checkingRuntime.label)
+                guard await ensureLauncherRuntimeInstalled(tracker: playOperations) else {
+                    throw HarborError.unsupportedRuntime(reason: "Launcher runtime could not be installed")
+                }
+            }
+            try throwIfCancelled()
+            guard let runtime else {
+                throw HarborError.unsupportedRuntime(reason: "No launcher runtime available")
+            }
+            launchProgress.begin(.preparingCompatibility)
+            playOperations.begin(LaunchProgress.preparingCompatibility.label)
+            let coordinator = sessionCoordinator ?? GameSessionCoordinator(services: services)
+            sessionCoordinator = coordinator
+            launchProgress.begin(.launching)
+            playOperations.begin(LaunchProgress.launching.label)
             let session = try await coordinator.launch(profile: profile, installation: verified, runtime: runtime)
             isGameRunning = true
-            status = "Game running (pid \(session.processIdentifier.map(String.init) ?? "?"))"
+            playOperations.succeed("Minecraft running (pid \(session.processIdentifier.map(String.init) ?? "?"))")
+            observeSessionEvents(sessionID: session.id)
             startLaunchWindowWatchers(session: session)
+            if cancelLaunchRequested { await stopGame() }
         } catch {
             isGameRunning = false
-            let msg = error.localizedDescription
-            if msg.lowercased().contains("pthread_sigmask")
-                || msg.lowercased().contains("cannot locate symbol")
-                || msg.lowercased().contains("failed to load minecraft")
-                || msg.lowercased().contains("please reinstall or wait") {
-                status = """
-                Minecraft \(installation.originalVersionName) failed to start.\n\
-                Harbor applies official mcpelauncher-updates patches on launch when available.\n\
-                Check Settings → Doctor, or re-import an owned APK. Detail: \(msg)
-                """
+            launchInFlight = false
+            launchProgress.clear()
+            if let harbor = error as? HarborError, harbor == .cancelled {
+                playOperations.reset()
             } else {
-                status = msg
+                let msg = error.localizedDescription
+                if msg.lowercased().contains("pthread_sigmask")
+                    || msg.lowercased().contains("cannot locate symbol")
+                    || msg.lowercased().contains("failed to load minecraft")
+                    || msg.lowercased().contains("please reinstall or wait") {
+                    playOperations.fail(
+                        "Minecraft \(installation.originalVersionName) failed to start — run Doctor or re-import the APK.",
+                        recovery: .runDoctor
+                    )
+                } else {
+                    playOperations.fail(
+                        OperationTracker.shortMessage(for: error),
+                        recovery: OperationTracker.recovery(for: error)
+                    )
+                }
             }
         }
     }
 
-    public func stopGame() async {
-        guard let coordinator = sessionCoordinator else {
-            status = "Nothing to stop"
-            return
+    /// Stop once the game process exists; cancel while still preparing.
+    public func requestCancelLaunch() async {
+        guard launchInFlight else { return }
+        if isGameRunning {
+            await stopGame()
+        } else {
+            cancelLaunchRequested = true
+            playOperations.begin("Cancelling…")
         }
+    }
+
+    public func stopGame() async {
+        guard let coordinator = sessionCoordinator else { return }
+        launchProgress.begin(.stopping)
+        playOperations.begin(LaunchProgress.stopping.label)
         try? await coordinator.requestStop()
         // No reconcileExited() here: the coordinator releases the lease itself
         // once the runtime confirms the process exited (terminal RuntimeEvent).
         isGameRunning = false
-        status = "Stop requested"
+    }
+
+    private func throwIfCancelled() throws {
+        if cancelLaunchRequested { throw HarborError.cancelled }
+    }
+
+    /// Applies a supervisor runtime event to the live launch UI state.
+    /// Returns true when the event was terminal — the session ended and Play
+    /// availability must be restored.
+    @discardableResult
+    func applyRuntimeEvent(_ event: RuntimeEvent) -> Bool {
+        guard LaunchProgress.isTerminal(event) else {
+            launchProgress.apply(event)
+            return false
+        }
+        launchProgress.clear()
+        launchInFlight = false
+        isGameRunning = false
+        if event.kind == .failed {
+            let detail = event.message.map { " \($0)" } ?? ""
+            playOperations.fail("Minecraft exited unexpectedly\(detail).", recovery: .runDoctor)
+        } else {
+            playOperations.succeed("Game closed — Play is ready again")
+        }
+        return true
+    }
+
+    /// Subscribes to the supervisor's event fan-out for one session: live
+    /// stages while it runs, and the terminal event that restores Play.
+    private func observeSessionEvents(sessionID: UUID) {
+        guard let launcher = services.runtimeLauncher else { return }
+        Task { @MainActor in
+            var sawTerminal = false
+            for await event in launcher.events(sessionID: sessionID) {
+                if self.applyRuntimeEvent(event) {
+                    sawTerminal = true
+                    break
+                }
+            }
+            if !sawTerminal {
+                // Stream ended without a terminal event (launcher without event
+                // support): the coordinator's fallback cleanup plus a local
+                // reset, so Play can never stay disabled.
+                await self.sessionCoordinator?.reconcileExited()
+                self.launchProgress.clear()
+                self.launchInFlight = false
+                self.isGameRunning = false
+            }
+        }
     }
 
     /// Game-window and Microsoft-helper measurement (Task 1 pieces): one
@@ -833,10 +1030,97 @@ public final class AppState {
         }
     }
 
+    // MARK: Diagnostics
+
     public func runDoctor() async {
-        let snap = (try? await DiagnosticsWorkflow(services: services).collect()) ?? DiagnosticsSnapshot()
-        doctorLines = snap.findings.map { "\($0.severity.rawValue): \($0.title) — \($0.detail)" }
-        status = "Doctor: \(snap.findings.count) checks"
+        diagnosticsOperations.begin("Running checks…")
+        do {
+            let snap = try await DiagnosticsWorkflow(services: services).collect()
+            doctorFindings = snap.findings
+            diagnosticsOperations.succeed("Doctor finished — \(snap.findings.count) checks")
+        } catch {
+            diagnosticsOperations.fail("Doctor failed: \(OperationTracker.shortMessage(for: error))")
+        }
+    }
+
+    /// Recent launch-timing sessions (newest last) for the Diagnostics table.
+    public func loadLaunchTimings() -> [LaunchTimingRecord] {
+        LaunchTimingRecorder.recentRecords(directory: services.paths.metadataDirectory)
+    }
+
+    /// Writes the redacted diagnostics bundle (doctor-preview.json) into a
+    /// user-chosen directory.
+    public func exportDiagnostics(to directory: URL) async {
+        diagnosticsOperations.begin("Collecting diagnostics…")
+        do {
+            let collector = FoundationDiagnosticsCollector(workflow: DiagnosticsWorkflow(services: services))
+            let url = try await collector.exportBundle(to: directory)
+            diagnosticsOperations.succeed("Exported \(url.lastPathComponent) to “\(directory.lastPathComponent)”")
+        } catch {
+            diagnosticsOperations.fail("Export failed: \(OperationTracker.shortMessage(for: error))")
+        }
+    }
+
+    // MARK: Settings actions
+
+    /// Force reinstall of the launcher runtime (Settings → Runtime maintenance):
+    /// downloads + deploys via the same installer used by the self-heal path,
+    /// with the shared download-progress plumbing.
+    public func reinstallRuntime() async {
+        guard !isInstalling else { return }
+        isInstalling = true
+        defer {
+            isInstalling = false
+            downloadProgress = nil
+        }
+        maintenanceOperations.begin("Reinstalling Minecraft Bedrock Launcher…")
+        downloadLabel = "Minecraft Bedrock Launcher"
+        do {
+            try await HarborRuntimeInstaller.install(status: { text in
+                Task { @MainActor in
+                    self.maintenanceOperations.begin(text)
+                    if let pctToken = text.range(of: #"\d+%"#, options: .regularExpression),
+                       let percent = Double(text[pctToken].dropLast()) {
+                        self.downloadProgress = percent / 100
+                        self.downloadDetail = ""
+                    }
+                }
+            })
+            guard let bundle = LocalRuntimeDiscovery().discoverDefault() else {
+                maintenanceOperations.fail("Launcher installed but not detected — restart Harbor.", recovery: .openSettings)
+                return
+            }
+            var runtimes = (try? await services.metadata.loadRuntimeInstallations()) ?? []
+            if let i = runtimes.firstIndex(where: { $0.releaseID == bundle.runtimeInstallation.releaseID }) {
+                runtimes[i] = bundle.runtimeInstallation
+            } else {
+                runtimes.append(bundle.runtimeInstallation)
+            }
+            try? await services.metadata.saveRuntimeInstallations(runtimes)
+            await reload()
+            maintenanceOperations.succeed("Launcher runtime reinstalled")
+        } catch {
+            maintenanceOperations.fail(
+                "Runtime reinstall failed: \(OperationTracker.shortMessage(for: error))",
+                recovery: .reinstallRuntime
+            )
+        }
+    }
+
+    /// Refreshes the mcpelauncher-updates compatibility catalog now (throws on
+    /// network failure — no silent offline fallback).
+    public func refreshCompatibilityPatches() async {
+        guard !maintenanceOperations.isWorking else { return }
+        maintenanceOperations.begin("Refreshing compatibility patches…")
+        do {
+            let url = try await HarborCompatibilityPatches.refreshCatalogNow()
+            maintenanceOperations.succeed("Compatibility patches refreshed (\(url.lastPathComponent))")
+        } catch {
+            maintenanceOperations.fail(
+                "Patch refresh failed: \(OperationTracker.shortMessage(for: error))",
+                recovery: OperationTracker.recovery(for: error)
+            )
+        }
     }
 
     public func deleteProfile(_ profile: Profile) async {
@@ -844,328 +1128,7 @@ public final class AppState {
             try? await workflow.delete(id: profile.id)
         }
         await reload()
-        status = "Deleted profile \(profile.name)"
-    }
-}
-
-// MARK: - Onboarding (forced, simple)
-
-public struct OnboardingView: View {
-    public let app: AppState
-    public init(app: AppState) { self.app = app }
-
-    public var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HarborCover(height: 120)
-
-            VStack(alignment: .leading, spacing: 14) {
-                StepRow(
-                    n: 1,
-                    title: "Sign in with Google Play",
-                    subtitle: app.hasVerifiedGame
-                        ? "Optional — Minecraft is already on this Mac"
-                        : "Needed only to download from Google Play",
-                    done: app.isPlaySignedIn || app.hasVerifiedGame,
-                    active: app.nextStep == 1 && !app.hasVerifiedGame
-                )
-                StepRow(
-                    n: 2,
-                    title: "Install Minecraft",
-                    subtitle: "Harbor downloads or imports your game",
-                    done: app.hasVerifiedGame,
-                    active: app.nextStep == 2
-                )
-                StepRow(
-                    n: 3,
-                    title: "Launch",
-                    subtitle: "Start the game",
-                    done: app.isGameRunning,
-                    active: app.nextStep == 3
-                )
-            }
-            .padding()
-            .background(Color.secondary.opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-
-            if !app.isPlaySignedIn {
-                Button {
-                    Task { await app.googleSignIn() }
-                } label: {
-                    HStack {
-                        if app.signInBusy { ProgressView() }
-                        Image(systemName: "person.crop.circle")
-                        Text("Sign in with Google Play")
-                            .font(.headline)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(app.signInBusy)
-            } else {
-                Text("Play account ready: \(app.playAccountLabel.isEmpty ? "Google Play" : app.playAccountLabel)")
-                    .foregroundStyle(.green)
-                    .font(.headline)
-            }
-
-            Button("I have an APK — skip Play download") {
-                app.useLocalAPK()
-            }
-            .buttonStyle(.link)
-            .font(.caption)
-
-            if let pct = app.downloadProgress {
-                DownloadProgressCard(
-                    label: app.downloadLabel.isEmpty ? "Minecraft" : app.downloadLabel,
-                    progress: pct,
-                    detail: app.downloadDetail
-                )
-            }
-
-            if !app.status.isEmpty {
-                Text(app.status)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(28)
-        .frame(maxWidth: 560, maxHeight: .infinity, alignment: .topLeading)
-        .task {
-            await app.reload()
-            await app.autoDetectLocalPackage()
-        }
-    }
-}
-
-// MARK: - Download progress
-
-struct DownloadProgressCard: View {
-    let label: String
-    let progress: Double
-    let detail: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Downloading \(label) — \(Int((progress * 100).rounded()))%")
-                    .font(.callout.weight(.medium))
-                Spacer()
-                if !detail.isEmpty {
-                    Text(detail)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            ProgressView(value: progress)
-        }
-        .padding(12)
-        .background(Color.secondary.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-    }
-}
-
-// MARK: - Home
-
-public struct HomeView: View {
-    public let app: AppState
-    public init(app: AppState) { self.app = app }
-
-    public var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                HarborCover(height: 96)
-
-                // Progress
-                VStack(alignment: .leading, spacing: 12) {
-                    StepRow(n: 1, title: "Google Play", subtitle: app.isPlaySignedIn ? app.playAccountLabel : "Not signed in", done: app.isPlaySignedIn, active: app.nextStep == 1)
-                    StepRow(n: 2, title: "Minecraft", subtitle: app.hasVerifiedGame ? (app.gameInstallation?.originalVersionName ?? "") : "Not installed", done: app.hasVerifiedGame, active: app.nextStep == 2)
-                    StepRow(n: 3, title: "Game", subtitle: app.isGameRunning ? "Running" : "Not running", done: app.isGameRunning, active: app.nextStep == 3)
-                }
-                .padding()
-                .background(Color.secondary.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-
-                // Primary action only
-                Group {
-                    switch app.nextStep {
-                    case 1:
-                        Button {
-                            Task { await app.googleSignIn() }
-                        } label: {
-                            Label("Sign in with Google Play", systemImage: "person.crop.circle")
-                                .font(.headline)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 12)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(app.signInBusy)
-                    case 2:
-                        VStack(spacing: 10) {
-                            Button {
-                                Task { await app.installGame() }
-                            } label: {
-                                Label(
-                                    app.isInstalling ? "Working…" : "Install / import Minecraft",
-                                    systemImage: "icloud.and.arrow.down"
-                                )
-                                .font(.headline)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 12)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(app.isInstalling)
-
-                            HStack(spacing: 12) {
-                                Button("Rescan packages") {
-                                    Task { await app.rescanPackages() }
-                                }
-                                Button("Install from APK / folder…") { app.importAPK() }
-                            }
-                            .font(.caption)
-                        }
-                    default:
-                        HStack(spacing: 12) {
-                            Button {
-                                Task { await app.launchGame() }
-                            } label: {
-                                Label("Launch", systemImage: "play.fill")
-                                    .font(.headline)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 12)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            if app.isGameRunning {
-                                Button("Stop") {
-                                    Task { await app.stopGame() }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Download progress
-                if let pct = app.downloadProgress {
-                    DownloadProgressCard(
-                        label: app.downloadLabel.isEmpty ? "Minecraft" : app.downloadLabel,
-                        progress: pct,
-                        detail: app.downloadDetail
-                    )
-                }
-
-                // Status
-                if !app.status.isEmpty {
-                    HStack {
-                        StatusPill(app.status, tone: app.status.lowercased().contains("ready")
-                                   || app.status.lowercased().contains("running")
-                                   || app.status.lowercased().contains("signed")
-                                   ? .ok : (app.status.lowercased().contains("cannot") || app.status.lowercased().contains("missing") ? .bad : .neutral))
-                        Spacer()
-                    }
-                }
-
-                // Compact details
-                GroupBox("Details") {
-                    VStack(alignment: .leading, spacing: 6) {
-                        LabeledContent("Profile", value: app.selectedProfile?.name ?? "—")
-                        LabeledContent("Runtime", value: app.runtime.map { "\($0.releaseID) [\($0.health.rawValue)]" } ?? "—")
-                        LabeledContent("Game", value: app.gameInstallation.map { "\($0.originalVersionName) [\($0.integrity.rawValue)]" } ?? "Not installed")
-                    }
-                    .padding(4)
-                }
-
-                // Secondary
-                HStack(spacing: 16) {
-                    Button("Open Minecraft on Play Store") { app.openPlayStoreListing() }
-                        .buttonStyle(.link)
-                    Button("Install from APK / folder…") { app.importAPK() }
-                        .buttonStyle(.link)
-                    Button("Rescan packages") { Task { await app.rescanPackages() } }
-                        .buttonStyle(.link)
-                    Button("Run setup again") { app.resetSetup() }
-                        .buttonStyle(.link)
-                    Spacer()
-                }
-                .font(.caption)
-            }
-            .padding(24)
-        }
-        .navigationTitle("BedrockHarbor")
-        .task { await app.reload() }
-    }
-}
-
-// MARK: - Settings
-
-public struct SettingsView: View {
-    public let app: AppState
-    public init(app: AppState) { self.app = app }
-
-    public var body: some View {
-        Form {
-            Section("Account") {
-                LabeledContent("Google Play", value: app.isPlaySignedIn ? app.playAccountLabel : "Not signed in")
-                Button("Sign in again") {
-                    Task { await app.googleSignIn(fresh: true) }
-                }
-                Button("Rescan packages") {
-                    Task { await app.rescanPackages() }
-                }
-                Button("Show setup steps") {
-                    app.resetSetup()
-                }
-            }
-            Section("Doctor") {
-                Button("Run checks") {
-                    Task { await app.runDoctor() }
-                }
-                if !app.doctorLines.isEmpty {
-                    ForEach(app.doctorLines, id: \.self) { line in
-                        Text(line).font(.caption)
-                    }
-                }
-            }
-            Section("Xbox / Microsoft sign-in help") {
-                Text("""
-                If the in-game Microsoft sign-in gets stuck on "Face, fingerprint, PIN or security key": \
-                Microsoft sometimes challenges embedded login windows with a passkey the window cannot open \
-                (known upstream limitation, minecraft-linux issue #1523) — your account is fine.\n\n\
-                Sign in with your password or PIN when offered, use "Use my password instead" or the other \
-                verification links in the challenge, or complete sign-in on another device where the \
-                challenge is available.\n\n\
-                If sign-in still fails: check Diagnostics → Doctor and the session log for \
-                mcpelauncher-webview errors. Llama error 0x80070057 means the helper's resources \
-                are broken — Settings → Runtime → Reinstall.
-                """)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-            }
-            Section("About") {
-                LabeledContent("App", value: "BedrockHarbor")
-                LabeledContent("License", value: "Apache-2.0")
-            }
-            Section("Credits") {
-                Text(creditsText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-        }
-        .formStyle(.grouped)
-        .navigationTitle("Settings")
-        .task { await app.reload() }
-    }
-
-    private var creditsText: String {
-        """
-        Runtime: minecraft-linux/mcpelauncher (macOS build), GPL-3.0
-        Compatibility mod: minecraft-linux/mcpelauncher-updates via mcpelauncher-moddb
-        Symbol shim & libc repair: BedrockHarbor, Apache-2.0
-        Google Play client: BedrockHarbor independent client
-        Game packages: user-owned; downloaded from Google Play by Harbor's Play client
-
-        BedrockHarbor is not affiliated with Mojang, Microsoft, Google, or the minecraft-linux maintainers.
-        """
+        playOperations.succeed("Deleted profile \(profile.name)")
     }
 }
 
@@ -1175,22 +1138,58 @@ public struct SettingsView: View {
 @Observable
 public final class HarborRootModel {
     public enum Item: String, CaseIterable, Identifiable, Hashable {
-        case home = "Home"
+        case play = "Play"
+        case installations = "Installations"
+        case accounts = "Accounts"
+        case diagnostics = "Diagnostics"
         case settings = "Settings"
         public var id: String { rawValue }
         public var icon: String {
             switch self {
-            case .home: return "house"
+            case .play: return "play.circle"
+            case .installations: return "square.and.arrow.down"
+            case .accounts: return "person.crop.circle"
+            case .diagnostics: return "stethoscope"
             case .settings: return "gearshape"
             }
         }
     }
 
-    public var selection: Item = .home
+    public var selection: Item = .play
     public let app: AppState
 
     public init(services: HarborServiceBundle) {
         self.app = AppState(services: services)
+    }
+
+    /// Executes a recovery action from a failure surface: navigates to the
+    /// section that owns the fix and starts it.
+    public func handle(_ recovery: OperationTracker.Recovery) {
+        switch recovery {
+        case .installGame:
+            selection = .installations
+            Task { await app.installGame() }
+        case .signIn:
+            selection = .accounts
+            Task { await app.googleSignIn() }
+        case .signInFresh:
+            selection = .accounts
+            Task { await app.googleSignIn(fresh: true) }
+        case .importPackage:
+            selection = .installations
+            app.importAPK()
+        case .rescan:
+            selection = .installations
+            Task { await app.rescanPackages() }
+        case .reinstallRuntime:
+            selection = .settings
+            Task { await app.reinstallRuntime() }
+        case .runDoctor:
+            selection = .diagnostics
+            Task { await app.runDoctor() }
+        case .openSettings:
+            selection = .settings
+        }
     }
 }
 
@@ -1209,45 +1208,47 @@ public struct HarborRootView: View {
     }
 
     public var body: some View {
-        Group {
-            if app.needsOnboarding {
-                OnboardingView(app: app)
-            } else {
-                NavigationSplitView {
-                    VStack(spacing: 0) {
-                        // Logo once at top — not on every nav row
-                        HStack(spacing: 10) {
-                            HarborLogo(size: 28)
-                            Text("BedrockHarbor")
-                                .font(.headline)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
-
-                        Divider()
-
-                        List(HarborRootModel.Item.allCases, selection: Binding(
-                            get: { model.selection },
-                            set: { if let v = $0 { model.selection = v } }
-                        )) { item in
-                            Label(item.rawValue, systemImage: item.icon)
-                                .tag(item)
-                        }
-                        .listStyle(.sidebar)
-                    }
-                    .navigationSplitViewColumnWidth(min: 170, ideal: 190)
-                } detail: {
-                    switch model.selection {
-                    case .home:
-                        HomeView(app: app)
-                    case .settings:
-                        SettingsView(app: app)
-                    }
+        NavigationSplitView {
+            VStack(spacing: 0) {
+                // Logo once at top — not on every nav row
+                HStack(spacing: 10) {
+                    HarborLogo(size: 28)
+                    Text("BedrockHarbor")
+                        .font(.headline)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+
+                Divider()
+
+                List(HarborRootModel.Item.allCases, selection: Binding(
+                    get: { model.selection },
+                    set: { if let v = $0 { model.selection = v } }
+                )) { item in
+                    Label(item.rawValue, systemImage: item.icon)
+                        .tag(item)
+                }
+                .listStyle(.sidebar)
+            }
+            .navigationSplitViewColumnWidth(min: 170, ideal: 190)
+        } detail: {
+            // No onboarding wall: navigation is always available, every screen
+            // shows its own missing requirements, and first-run users land on
+            // Play with the embedded readiness checklist.
+            switch model.selection {
+            case .play:
+                PlayView(app: app, onRecovery: model.handle)
+            case .installations:
+                InstallationsView(app: app, onRecovery: model.handle)
+            case .accounts:
+                AccountsView(app: app, onRecovery: model.handle)
+            case .diagnostics:
+                DiagnosticsView(app: app, onRecovery: model.handle)
+            case .settings:
+                SettingsView(app: app, onRecovery: model.handle)
             }
         }
-        .frame(minWidth: 800, minHeight: 520)
         .task {
             await app.reload()
             app.refreshGate()
