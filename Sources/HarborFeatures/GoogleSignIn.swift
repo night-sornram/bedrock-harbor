@@ -132,7 +132,7 @@ public final class GoogleSignInController {
     private static func clearGoogleCookies(store: WKWebsiteDataStore) async {
         let cookies = await store.httpCookieStore.allCookies()
         for cookie in cookies where cookie.domain.lowercased().contains("google") {
-            await store.httpCookieStore.delete(cookie)
+            await store.httpCookieStore.deleteCookie(cookie)
         }
         PlaySessionStore.save(cookies: [:], email: nil)
     }
@@ -248,33 +248,28 @@ public final class GoogleSignInController {
           } catch (e) { return null; }
         })();
         """
-        webView.evaluateJavaScript(js) { [weak self] result, _ in
-            guard let self else { return }
-            Task { @MainActor in
-                if let dict = result as? [String: Any] {
-                    if let token = dict["token"] as? String, !token.isEmpty {
-                        HarborPlayTokenBridge.saveOAuthToken(token)
-                        self.capturedOAuthToken = true
-                    }
-                    if let email = dict["email"] as? String, email.contains("@") {
-                        self.signedInEmail = email
-                        HarborPlayTokenBridge.saveAccountEmail(email)
-                        PlaySessionStore.save(cookies: PlaySessionStore.load().cookies, email: email)
-                    }
-                } else if let email = result as? String, email.contains("@") {
-                    self.signedInEmail = email
-                    HarborPlayTokenBridge.saveAccountEmail(email)
-                }
-                if let token = HarborPlayTokenBridge.loadOAuthToken() {
-                    self.capturedOAuthToken = true
-                    _ = token
-                    if !self.didFinish {
-                        self.finish(email: self.signedInEmail, userInitiated: false)
-                    }
-                }
-                self.refreshStatusLabels()
+        let result = try? await webView.evaluateJavaScript(js)
+        if let dict = result as? [String: Any] {
+            if let token = dict["token"] as? String, !token.isEmpty {
+                HarborPlayTokenBridge.saveOAuthToken(token)
+                capturedOAuthToken = true
+            }
+            if let email = dict["email"] as? String, email.contains("@") {
+                signedInEmail = email
+                HarborPlayTokenBridge.saveAccountEmail(email)
+                PlaySessionStore.save(cookies: PlaySessionStore.load().cookies, email: email)
+            }
+        } else if let email = result as? String, email.contains("@") {
+            signedInEmail = email
+            HarborPlayTokenBridge.saveAccountEmail(email)
+        }
+        if HarborPlayTokenBridge.loadOAuthToken() != nil {
+            capturedOAuthToken = true
+            if !didFinish {
+                finish(email: signedInEmail, userInitiated: false)
             }
         }
+        refreshStatusLabels()
     }
 
     fileprivate func noteFail(message: String) {
@@ -361,15 +356,13 @@ public final class GoogleSignInController {
         weak var owner: GoogleSignInController?
         init(owner: GoogleSignInController) { self.owner = owner }
 
+        // Navigation is observed at completion (didFinish) only, on purpose: a
+        // decidePolicyFor witness fires for transient OAuth redirects too, and URLs
+        // carrying access_token/token params would save a token early — the harvest
+        // timer then auto-finishes the window before Android setup sets the
+        // oauth_token cookie the Play download needs, forcing a second login.
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             owner?.noteNavigation(url: webView.url)
-        }
-
-        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            if let url = navigationAction.request.url {
-                owner?.noteNavigation(url: url)
-            }
-            decisionHandler(.allow)
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

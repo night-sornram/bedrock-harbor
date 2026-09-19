@@ -43,9 +43,9 @@ public struct PlayDeliveryClient: Sendable {
             "X-DFE-SmallestScreenWidthDp": "411",
             "X-DFE-MCCMNC": "310260",
         ]
-        if let sapisid = auth.cookies["SAPISID"] ?? auth.cookies["__Secure-3PSID"] ?? auth.cookies["SID"] {
-            if auth.cookies["SAPISID"] != nil {
-                headers["Authorization"] = Self.sapisidHash(sapisid: auth.cookies["SAPISID"]!)
+        if auth.cookies["SAPISID"] != nil || auth.cookies["__Secure-3PSID"] != nil || auth.cookies["SID"] != nil {
+            if let sapisid = auth.cookies["SAPISID"] {
+                headers["Authorization"] = Self.sapisidHash(sapisid: sapisid)
             }
         }
 

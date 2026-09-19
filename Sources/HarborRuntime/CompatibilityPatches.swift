@@ -516,8 +516,8 @@ public struct HarborCompatibilityPatches: Sendable {
             return modDir
         }
 
-        if let rule = knownIncompatibility(gameVersionName: versionName, modVersion: meta.version) {
-            // Official mod crashes for this game generation (see rule.reason): bypass it and
+        if knownIncompatibility(gameVersionName: versionName, modVersion: meta.version) != nil {
+            // Official mod crashes for this game generation (see the rule's reason): bypass it and
             // apply Harbor's stack. Verified with Minecraft 1.26.51.1 on runtime v1.8.4-573.
             if let runtimeRoot {
                 _ = GuestLibcCompatibilityPatch.patch(runtimeRoot: runtimeRoot)

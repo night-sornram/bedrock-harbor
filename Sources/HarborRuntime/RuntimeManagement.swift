@@ -285,7 +285,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         runtime: RuntimeInstallation
     ) async throws -> LaunchPlan {
         if let bundle = LocalRuntimeDiscovery().discoverDefault() {
-            await registerLayout(bundle.layout)
+            registerLayout(bundle.layout)
             let install = bundle.gameInstallation.integrity == .verified ? bundle.gameInstallation : installation
             return try await makePlan(profile: profile, installation: install, runtime: bundle.runtimeInstallation, layout: bundle.layout)
         }

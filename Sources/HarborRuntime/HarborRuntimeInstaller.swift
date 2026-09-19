@@ -111,8 +111,8 @@ public enum HarborRuntimeInstaller {
         var mounted = false
         defer {
             if mounted {
-                try? runTool("/usr/bin/hdiutil", ["detach", mountPoint.path])
-                try? runTool("/usr/bin/hdiutil", ["detach", "-force", mountPoint.path])
+                _ = try? runTool("/usr/bin/hdiutil", ["detach", mountPoint.path])
+                _ = try? runTool("/usr/bin/hdiutil", ["detach", "-force", mountPoint.path])
             }
             try? fm.removeItem(at: mountPoint)
         }
@@ -120,7 +120,7 @@ public enum HarborRuntimeInstaller {
             try runTool("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly", "-mountpoint", mountPoint.path])
             mounted = true
         } catch {
-            try? runTool("/usr/bin/hdiutil", ["detach", mountPoint.path])
+            _ = try? runTool("/usr/bin/hdiutil", ["detach", mountPoint.path])
             try? fm.removeItem(at: mountPoint)
             throw error
         }

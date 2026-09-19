@@ -599,7 +599,7 @@ public struct HarborPlayClient: Sendable {
     static func decodeAndroidId(from data: Data) -> (androidId: String, securityToken: String?)? {
         // Search for 8-byte android id patterns and nearby security token strings.
         var androidId: String?
-        var security: String?
+        let security: String? = nil
         var i = data.startIndex
         while i < data.endIndex {
             // field 7 fixed64 / varint common layouts — best-effort scan for hex-like tokens

@@ -94,7 +94,7 @@ public enum LocalLaunchBootstrap {
             }
         }
 
-        if acquire.didImport, let install = acquire.installation {
+        if acquire.didImport, acquire.installation != nil {
             return "Runtime ready · \(acquire.message) · Launch should work"
         }
         if acquire.installation != nil {
