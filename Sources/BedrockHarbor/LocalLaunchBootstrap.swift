@@ -19,7 +19,8 @@ public enum LocalLaunchBootstrap {
     @discardableResult
     public static func prepareIfNeeded(
         services: HarborServiceBundle,
-        launcher: ProcessLaunchSupervisor
+        launcher: ProcessLaunchSupervisor,
+        timing: LaunchTimingRecorder? = nil
     ) async throws -> String {
         try services.paths.ensurePrivateDirectoryLayout()
         // Self-heal a missing launcher runtime (e.g. after a data wipe) instead of
@@ -29,6 +30,7 @@ public enum LocalLaunchBootstrap {
             bundle = existing
         } else {
             _ = try await HarborRuntimeInstaller.ensureInstalled()
+            await timing?.mark(.runtimeInstall)
             guard let installed = LocalRuntimeDiscovery().discoverDefault() else {
                 throw HarborError.unsupportedRuntime(
                     reason: "Minecraft Bedrock Launcher could not be installed automatically — check the network and reopen Harbor"
@@ -36,6 +38,7 @@ public enum LocalLaunchBootstrap {
             }
             bundle = installed
         }
+        await timing?.mark(.bootstrapDiscovery)
         await launcher.registerLayout(bundle.layout)
 
         var runtimes = (try? await services.metadata.loadRuntimeInstallations()) ?? []
@@ -84,6 +87,7 @@ public enum LocalLaunchBootstrap {
 
         // Auto-acquire game package into Harbor Installations (no manual user step).
         let acquire = await GamePackageAcquirer.acquire(services: services)
+        await timing?.mark(.packageAcquisition)
         if let install = acquire.installation {
             var profs = (try? await services.metadata.loadProfiles()) ?? []
             if var first = profs.first {

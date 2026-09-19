@@ -20,6 +20,7 @@ final class AppBootstrap {
         didStart = true
         do {
             let paths = try HarborPaths.live()
+            let timing = LaunchTimingRecorder(directory: paths.metadataDirectory)
             let launcher = ProcessLaunchSupervisor(paths: paths)
             let bundle = try CompositionRoot.makeFoundationBundle(
                 paths: paths,
@@ -28,8 +29,14 @@ final class AppBootstrap {
             )
             services = bundle
             Task {
+                await timing.begin(kind: "appStart")
+                await timing.mark(.appLaunch)
                 do {
-                    bootstrapNote = try await LocalLaunchBootstrap.prepareIfNeeded(services: bundle, launcher: launcher)
+                    bootstrapNote = try await LocalLaunchBootstrap.prepareIfNeeded(
+                        services: bundle,
+                        launcher: launcher,
+                        timing: timing
+                    )
                 } catch {
                     bootstrapNote = error.localizedDescription
                 }
