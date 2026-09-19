@@ -930,12 +930,22 @@ public final class AppState {
         }
     }
 
+    /// True only while a launch is still preparing: reserved, no process yet,
+    /// and not already stopping. Drives the Cancel button — after Stop is
+    /// pressed (`isGameRunning` drops, stage `.stopping`, reservation held
+    /// until the terminal event) nothing is cancellable anymore.
+    public var canCancelLaunchPreparation: Bool {
+        launchInFlight && !isGameRunning && launchProgress.stage != .stopping
+    }
+
     /// Stop once the game process exists; cancel while still preparing.
     public func requestCancelLaunch() async {
         guard launchInFlight else { return }
         if isGameRunning {
             await stopGame()
-        } else {
+        } else if launchProgress.stage != .stopping {
+            // Guarded on stage too: a Stop already in progress must keep its
+            // "Stopping Minecraft" label — there is nothing left to cancel.
             cancelLaunchRequested = true
             playOperations.begin("Cancelling…")
         }

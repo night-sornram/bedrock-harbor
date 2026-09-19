@@ -145,7 +145,10 @@ public struct PlayView: View {
                     Label("Stop", systemImage: "stop.fill")
                 }
                 .accessibilityLabel("Stop Minecraft")
-            } else if app.launchInFlight {
+            } else if app.canCancelLaunchPreparation {
+                // Strictly during preparation: once Stop is pressed the
+                // reservation is held until the terminal event, and Cancel
+                // must not reappear (or clobber the "Stopping" label).
                 Button("Cancel") {
                     Task { await app.requestCancelLaunch() }
                 }

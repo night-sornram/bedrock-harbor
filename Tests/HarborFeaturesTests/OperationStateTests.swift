@@ -172,6 +172,38 @@ struct OperationStateTests {
         }
     }
 
+    /// Cancel belongs strictly to launch preparation. After Stop is pressed,
+    /// `stopGame()` drops `isGameRunning` while `launchInFlight` stays set
+    /// until the terminal event — that stopping window must NOT offer Cancel
+    /// (nothing is cancellable anymore, and pressing it would overwrite the
+    /// "Stopping Minecraft" label).
+    @Test func cancelAvailableOnlyDuringPreparationNotStopping() async throws {
+        let services = try Self.makeServices()
+        let app = AppState(services: services)
+        await app.reload()
+
+        // Preparation: reserved, no process yet — Cancel available.
+        app.launchInFlight = true
+        app.isGameRunning = false
+        app.launchProgress.begin(.verifyingPackage)
+        #expect(app.canCancelLaunchPreparation)
+
+        // Stopping window: Stop was pressed (isGameRunning false, stage
+        // .stopping, reservation still held) — Cancel must stay hidden.
+        app.launchProgress.begin(.stopping)
+        #expect(!app.canCancelLaunchPreparation)
+
+        // Terminal event: session over — Cancel hidden because nothing is in flight.
+        _ = app.applyRuntimeEvent(RuntimeEvent(sessionID: UUID(), kind: .exited, exitCode: 0))
+        #expect(!app.canCancelLaunchPreparation)
+
+        // Fresh run reaches process creation: Stop's domain — Cancel hidden.
+        app.launchInFlight = true
+        app.isGameRunning = true
+        app.launchProgress.begin(.running(stage: "running"))
+        #expect(!app.canCancelLaunchPreparation)
+    }
+
     // MARK: - Helpers
 
     private static func makeServices() throws -> HarborServiceBundle {
