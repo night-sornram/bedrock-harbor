@@ -207,6 +207,9 @@ struct OperationStateTests {
     // MARK: - Helpers
 
     private static func makeServices() throws -> HarborServiceBundle {
+        // AppState.reload() reads the process-global Play credential stores —
+        // isolate them (temp home + test defaults suite) before constructing it.
+        PlayStoreIsolation.activate()
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("bh-opstate-\(UUID().uuidString)", isDirectory: true)
         let paths = HarborPaths(

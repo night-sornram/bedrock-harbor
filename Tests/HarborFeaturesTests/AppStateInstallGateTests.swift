@@ -8,9 +8,10 @@ import HarborGooglePlay
 import HarborPlatform
 
 @MainActor
-@Suite("AppState install gate")
+@Suite("AppState install gate", .serialized)
 struct AppStateInstallGateTests {
     private func makeServices() throws -> HarborServiceBundle {
+        PlayStoreIsolation.activate()
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("bh-features-\(UUID().uuidString)", isDirectory: true)
         let paths = HarborPaths(
@@ -228,17 +229,24 @@ struct AppStateInstallGateTests {
         #expect(app.hasVerifiedGame, "metadata appeared while app ran — UI must reflect it without user action")
     }
 
-    /// The Play store is process-global (UserDefaults + real-home files), so
-    /// parallel tests would race on it — one test, sequential phases.
+    /// The Play store is process-global; tests run it against the shared
+    /// ISOLATED temp stores (PlayStoreIsolation), so resetting clears only
+    /// those — never the real user's ~/Library or UserDefaults.standard.
+    /// Credential-asserting tests serialize (one test, sequential phases)
+    /// because the temp store is shared per-process.
     private func resetPlayState() {
-        let d = UserDefaults.standard
+        let d = PlayStoreIsolation.defaults
         d.removeObject(forKey: "com.bedrockharbor.play.oauth")
         d.removeObject(forKey: "com.bedrockharbor.play.cookies")
         d.removeObject(forKey: "com.bedrockharbor.play.email")
-        let support = FileManager.default.homeDirectoryForCurrentUser
+        let support = PlayStoreIsolation.home
             .appendingPathComponent("Library/Application Support/BedrockHarbor", isDirectory: true)
         try? FileManager.default.removeItem(at: support.appendingPathComponent("play-session.json"))
         try? FileManager.default.removeItem(at: support.appendingPathComponent("play-oauth.token"))
+        // Also drop the wipe-surviving backup so "signed out" phases stay
+        // deterministic regardless of test order within the serialized suite.
+        try? FileManager.default.removeItem(
+            at: PlayStoreIsolation.home.appendingPathComponent(".bedrockharbor/credentials.json"))
     }
 
     /// A token string saved over an anonymous cookie bag is a failed-login
@@ -246,6 +254,7 @@ struct AppStateInstallGateTests {
     /// "Google Play ready" for a session that never signed in. A completed
     /// sign-in (oauth_token cookie in the bag) must survive the same reload.
     @Test func playSessionSelfHealsFromAnonymousLeftover() async throws {
+        PlayStoreIsolation.activate()
         resetPlayState()
         defer { resetPlayState() }
 
@@ -280,8 +289,12 @@ struct AppStateInstallGateTests {
     /// Credentials must survive Application Support wipes — they live in a
     /// chmod-600 dotfile in the user's home.
     @Test func playCredentialBackupSurvivesOutsideAppSupport() {
+        PlayStoreIsolation.activate()
         let fm = FileManager.default
-        let url = fm.homeDirectoryForCurrentUser.appendingPathComponent(".bedrockharbor/credentials.json")
+        // Isolated backup file (inside the throwaway PlayStoreIsolation home)
+        // — start clean so the round-trip below is deterministic.
+        let url = PlayStoreIsolation.home.appendingPathComponent(".bedrockharbor/credentials.json")
+        try? fm.removeItem(at: url)
         defer { try? fm.removeItem(at: url) }
 
         PlayCredentialBackup.save(oauth: "oauth2_4/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", email: "a@gmail.com")

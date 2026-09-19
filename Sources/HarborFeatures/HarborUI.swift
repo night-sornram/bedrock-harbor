@@ -217,6 +217,11 @@ public final class AppState {
 
     private static let localAPKKey = "com.bedrockharbor.localapk.mode"
     private static let onboardKey = "com.bedrockharbor.onboarding.completed"
+
+    /// Test seam: overrides the settings defaults (nil in production → .standard).
+    nonisolated(unsafe) public static var defaultsOverride: UserDefaults?
+    private static var defaults: UserDefaults { defaultsOverride ?? .standard }
+
     /// Process name of the runtime's Microsoft sign-in helper (Qt webview).
     private static let microsoftHelperProcessName = "mcpelauncher-webview"
     /// The helper spawns only when the player opens Microsoft sign-in in-game —
@@ -227,7 +232,7 @@ public final class AppState {
     public init(services: HarborServiceBundle) {
         self.services = services
         self.sessionCoordinator = GameSessionCoordinator(services: services)
-        self.needsOnboarding = !UserDefaults.standard.bool(forKey: Self.localAPKKey)
+        self.needsOnboarding = !Self.defaults.bool(forKey: Self.localAPKKey)
         bootstrapBox.token = NotificationCenter.default.addObserver(
             forName: .harborBootstrapFinished,
             object: nil,
@@ -254,7 +259,7 @@ public final class AppState {
     /// mutating actions — never from a SwiftUI `body`.
     func refreshDerivedState() {
         let profile = selectedProfile
-        usedLocalAPK = UserDefaults.standard.bool(forKey: Self.localAPKKey)
+        usedLocalAPK = Self.defaults.bool(forKey: Self.localAPKKey)
 
         // gameInstallation honors the profile: its selected install first,
         // then first verified, then first.
@@ -358,12 +363,12 @@ public final class AppState {
 
     public func completeOnboardingFromLogin() {
         needsOnboarding = false
-        UserDefaults.standard.set(true, forKey: Self.onboardKey)
+        Self.defaults.set(true, forKey: Self.onboardKey)
         refreshGate()
     }
 
     public func useLocalAPK() {
-        UserDefaults.standard.set(true, forKey: Self.localAPKKey)
+        Self.defaults.set(true, forKey: Self.localAPKKey)
         usedLocalAPK = true
         needsOnboarding = false
         installOperations.succeed("Local package mode — Install from APK / folder… or Rescan packages")
@@ -387,10 +392,10 @@ public final class AppState {
     }
 
     public func resetSetup() {
-        UserDefaults.standard.set(false, forKey: Self.localAPKKey)
+        Self.defaults.set(false, forKey: Self.localAPKKey)
         usedLocalAPK = false
         needsOnboarding = true
-        UserDefaults.standard.set(false, forKey: Self.onboardKey)
+        Self.defaults.set(false, forKey: Self.onboardKey)
         refreshDerivedState()
         refreshGate()
         maintenanceOperations.succeed("Setup reset — the readiness checklist on Play shows what is missing")

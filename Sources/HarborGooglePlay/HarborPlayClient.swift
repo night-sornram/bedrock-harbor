@@ -662,48 +662,48 @@ public enum HarborPlayTokenBridge {
 
     private static let accountEmailKey = "com.bedrockharbor.play.accountEmail"
 
+    /// Test seam: overrides the storage home (nil in production → real home).
+    nonisolated(unsafe) public static var homeOverride: URL?
+    /// Test seam: overrides the defaults store (nil in production → .standard).
+    nonisolated(unsafe) public static var defaultsOverride: UserDefaults?
+
+    private static var defaults: UserDefaults { defaultsOverride ?? .standard }
+    private static var supportRoot: URL {
+        (homeOverride ?? FileManager.default.homeDirectoryForCurrentUser)
+            .appendingPathComponent("Library/Application Support/BedrockHarbor", isDirectory: true)
+    }
+    private static var tokenFileURL: URL {
+        supportRoot.appendingPathComponent("play-oauth.token", isDirectory: false)
+    }
+
     public static func saveOAuthToken(_ token: String) {
         let t = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard looksLikeOAuthAccessToken(t) else { return }
-        UserDefaults.standard.set(t, forKey: "com.bedrockharbor.play.oauth")
-        try? FileManager.default.createDirectory(
-            at: FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/BedrockHarbor", isDirectory: true),
-            withIntermediateDirectories: true
-        )
-        try? t.write(
-            to: FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/BedrockHarbor/play-oauth.token"),
-            atomically: true,
-            encoding: .utf8
-        )
+        defaults.set(t, forKey: "com.bedrockharbor.play.oauth")
+        try? FileManager.default.createDirectory(at: supportRoot, withIntermediateDirectories: true)
+        try? t.write(to: tokenFileURL, atomically: true, encoding: .utf8)
     }
 
     public static func clearOAuthToken() {
-        UserDefaults.standard.removeObject(forKey: "com.bedrockharbor.play.oauth")
-        try? FileManager.default.removeItem(
-            at: FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/BedrockHarbor/play-oauth.token")
-        )
+        defaults.removeObject(forKey: "com.bedrockharbor.play.oauth")
+        try? FileManager.default.removeItem(at: tokenFileURL)
     }
 
     public static func saveAccountEmail(_ email: String?) {
         guard let email = email?.trimmingCharacters(in: .whitespacesAndNewlines), email.contains("@") else { return }
-        UserDefaults.standard.set(email, forKey: accountEmailKey)
+        defaults.set(email, forKey: accountEmailKey)
     }
 
     public static func loadAccountEmail() -> String? {
-        guard let email = UserDefaults.standard.string(forKey: accountEmailKey), email.contains("@") else { return nil }
+        guard let email = defaults.string(forKey: accountEmailKey), email.contains("@") else { return nil }
         return email
     }
 
     public static func loadOAuthToken() -> String? {
-        if let t = UserDefaults.standard.string(forKey: "com.bedrockharbor.play.oauth"), looksLikeOAuthAccessToken(t) {
+        if let t = defaults.string(forKey: "com.bedrockharbor.play.oauth"), looksLikeOAuthAccessToken(t) {
             return t
         }
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BedrockHarbor/play-oauth.token")
-        if let t = try? String(contentsOf: url, encoding: .utf8), looksLikeOAuthAccessToken(t) {
+        if let t = try? String(contentsOf: tokenFileURL, encoding: .utf8), looksLikeOAuthAccessToken(t) {
             return t.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return nil

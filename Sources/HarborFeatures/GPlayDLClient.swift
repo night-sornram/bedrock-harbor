@@ -21,8 +21,11 @@ enum PlayCredentialBackup {
         var email: String?
     }
 
+    /// Test seam: overrides the credentials file URL (nil in production).
+    nonisolated(unsafe) static var urlOverride: URL?
+
     private static var url: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        urlOverride ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".bedrockharbor/credentials.json", isDirectory: false)
     }
 

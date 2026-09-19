@@ -9,8 +9,15 @@ public enum PlaySessionStore {
     private static let defaultsCookiesKey = "com.bedrockharbor.play.cookies"
     private static let defaultsEmailKey = "com.bedrockharbor.play.email"
 
+    /// Test seam: overrides the storage home (nil in production → real home).
+    nonisolated(unsafe) public static var homeOverride: URL?
+    /// Test seam: overrides the defaults store (nil in production → .standard).
+    nonisolated(unsafe) public static var defaultsOverride: UserDefaults?
+
+    private static var defaults: UserDefaults { defaultsOverride ?? .standard }
+
     private static var fileURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        (homeOverride ?? FileManager.default.homeDirectoryForCurrentUser)
             .appendingPathComponent("Library/Application Support/BedrockHarbor/play-session.json", isDirectory: false)
     }
 
@@ -21,8 +28,8 @@ public enum PlaySessionStore {
     }
 
     public static func save(cookies: [String: String], email: String?) {
-        UserDefaults.standard.set(cookies, forKey: defaultsCookiesKey)
-        if let email { UserDefaults.standard.set(email, forKey: defaultsEmailKey) }
+        defaults.set(cookies, forKey: defaultsCookiesKey)
+        if let email { defaults.set(email, forKey: defaultsEmailKey) }
         let payload = Payload(cookies: cookies, email: email, savedAt: Date())
         if let data = try? JSONEncoder().encode(payload) {
             try? FileManager.default.createDirectory(
@@ -40,8 +47,8 @@ public enum PlaySessionStore {
            !payload.cookies.isEmpty {
             return DeliveryAuth(cookies: payload.cookies, accountEmail: payload.email)
         }
-        let cookies = UserDefaults.standard.dictionary(forKey: defaultsCookiesKey) as? [String: String] ?? [:]
-        let email = UserDefaults.standard.string(forKey: defaultsEmailKey)
+        let cookies = defaults.dictionary(forKey: defaultsCookiesKey) as? [String: String] ?? [:]
+        let email = defaults.string(forKey: defaultsEmailKey)
         return DeliveryAuth(cookies: cookies, accountEmail: email)
     }
 
