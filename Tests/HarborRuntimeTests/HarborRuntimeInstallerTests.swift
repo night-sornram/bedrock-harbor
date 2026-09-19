@@ -26,6 +26,11 @@ final class HarborRuntimeInstallerTests: XCTestCase {
         let client = contents.appendingPathComponent("MacOS/mcpelauncher-client")
         try "#!/bin/sh\nexit 0\n".write(to: client, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: client.path)
+        // The Microsoft sign-in helper — deploy validates it after copying
+        // (validateHelperResources), so the fixture must carry the full layout.
+        let webview = contents.appendingPathComponent("MacOS/mcpelauncher-webview")
+        try "#!/bin/sh\nexit 0\n".write(to: webview, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: webview.path)
         // The bundle's Qt plugins — mcpelauncher-webview (Microsoft sign-in) aborts
         // without the cocoa platform plugin.
         try fm.createDirectory(at: contents.appendingPathComponent("PlugIns/platforms"), withIntermediateDirectories: true)
@@ -34,6 +39,9 @@ final class HarborRuntimeInstallerTests: XCTestCase {
             atomically: true,
             encoding: .utf8
         )
+        // QML modules the helper resolves through its executable-side qt.conf.
+        try fm.createDirectory(at: contents.appendingPathComponent("Resources/qml/QtQuick"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: contents.appendingPathComponent("Resources/qml/QtWebEngine"), withIntermediateDirectories: true)
         try "controller db".write(
             to: contents.appendingPathComponent("Resources/mcpelauncher/gamecontrollerdb.txt"),
             atomically: true,
@@ -157,7 +165,6 @@ final class HarborRuntimeInstallerTests: XCTestCase {
         // A browser-downloaded engine DMG carries com.apple.quarantine on its files.
         // Gatekeeper then blocks the sign-in webview's plugins ("Apple could not
         // verify…") when the game spawns mcpelauncher-webview — deploy must strip it.
-        let fm = FileManager.default
         let sourcePaths = [
             contents.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib").path,
             contents.appendingPathComponent("MacOS/mcpelauncher-client").path,
@@ -196,6 +203,100 @@ final class HarborRuntimeInstallerTests: XCTestCase {
                 appContents: notAnApp,
                 destination: tempDir.appendingPathComponent("dest", isDirectory: true)
             )
+        )
+    }
+
+    // MARK: - Microsoft helper-resource validation
+
+    /// Runtime root carrying every helper resource `validateHelperResources`
+    /// checks (the pinned DMG layout, with qt.conf as deploy writes it).
+    private func makeFullHelperRuntimeRoot() throws -> URL {
+        let fm = FileManager.default
+        let root = tempDir.appendingPathComponent("helper-root-\(UUID().uuidString)", isDirectory: true)
+        for rel in ["MacOS", "PlugIns/platforms", "Resources/qml/QtQuick", "Resources/qml/QtWebEngine"] {
+            try fm.createDirectory(
+                at: root.appendingPathComponent(rel, isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        let webview = root.appendingPathComponent("MacOS/mcpelauncher-webview")
+        try "#!/bin/sh\nexit 0\n".write(to: webview, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: webview.path)
+        try "fake cocoa plugin".write(
+            to: root.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "[Paths]\nPrefix = ..\n".write(
+            to: root.appendingPathComponent("MacOS/qt.conf"),
+            atomically: true,
+            encoding: .utf8
+        )
+        return root
+    }
+
+    func testValidateHelperResourcesAcceptsFullRuntimeRoot() throws {
+        let root = try makeFullHelperRuntimeRoot()
+        XCTAssertEqual(HarborRuntimeInstaller.validateHelperResources(root: root), [])
+    }
+
+    func testValidateHelperResourcesNamesEachMissingPiece() throws {
+        let pieces: [(name: String, path: String)] = [
+            ("Microsoft sign-in helper (MacOS/mcpelauncher-webview)", "MacOS/mcpelauncher-webview"),
+            ("Qt platform plugin (PlugIns/platforms/libqcocoa.dylib)", "PlugIns/platforms/libqcocoa.dylib"),
+            ("Qt configuration (MacOS/qt.conf)", "MacOS/qt.conf"),
+            ("QtQuick modules (Resources/qml/QtQuick)", "Resources/qml/QtQuick"),
+            ("QtWebEngine modules (Resources/qml/QtWebEngine)", "Resources/qml/QtWebEngine"),
+        ]
+        for piece in pieces {
+            let root = try makeFullHelperRuntimeRoot()
+            try FileManager.default.removeItem(at: root.appendingPathComponent(piece.path))
+            XCTAssertEqual(
+                HarborRuntimeInstaller.validateHelperResources(root: root),
+                [piece.name],
+                "removing \(piece.path) must name exactly that piece"
+            )
+        }
+    }
+
+    func testValidateHelperResourcesRequiresExecutableWebview() throws {
+        let root = try makeFullHelperRuntimeRoot()
+        // A webview present but not executable cannot be spawned by the game.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: root.appendingPathComponent("MacOS/mcpelauncher-webview").path
+        )
+        XCTAssertEqual(
+            HarborRuntimeInstaller.validateHelperResources(root: root),
+            ["Microsoft sign-in helper (MacOS/mcpelauncher-webview)"]
+        )
+    }
+
+    func testDeployRejectsBundleMissingMicrosoftSignInHelper() throws {
+        let contents = try makeFakeAppContents()
+        try FileManager.default.removeItem(at: contents.appendingPathComponent("MacOS/mcpelauncher-webview"))
+
+        XCTAssertThrowsError(
+            try HarborRuntimeInstaller.deploy(
+                appContents: contents,
+                destination: tempDir.appendingPathComponent("dest", isDirectory: true)
+            )
+        ) { error in
+            guard case HarborError.invalidPackage(let reason) = error else {
+                return XCTFail("expected invalidPackage, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("mcpelauncher-webview"), "reason must list the missing piece: \(reason)")
+        }
+    }
+
+    func testRuntimeReadinessRunsTheSameChecksAsInstallValidation() throws {
+        let full = try makeFullHelperRuntimeRoot()
+        XCTAssertEqual(RuntimeReadiness.missingPieces(runtimeRoot: full), [])
+
+        try FileManager.default.removeItem(at: full.appendingPathComponent("Resources/qml/QtWebEngine"))
+        XCTAssertEqual(
+            RuntimeReadiness.missingPieces(runtimeRoot: full),
+            ["QtWebEngine modules (Resources/qml/QtWebEngine)"]
         )
     }
 

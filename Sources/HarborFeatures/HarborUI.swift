@@ -127,6 +127,12 @@ public final class AppState {
 
     private static let localAPKKey = "com.bedrockharbor.localapk.mode"
     private static let onboardKey = "com.bedrockharbor.onboarding.completed"
+    /// Process name of the runtime's Microsoft sign-in helper (Qt webview).
+    private static let microsoftHelperProcessName = "mcpelauncher-webview"
+    /// The helper spawns only when the player opens Microsoft sign-in in-game —
+    /// often minutes into a session — so its spawn watcher gets a longer bound
+    /// than the default. Marks after the timing session ends are ignored.
+    private static let microsoftHelperWatchTimeout: TimeInterval = 600
 
     public init(services: HarborServiceBundle) {
         self.services = services
@@ -766,6 +772,7 @@ public final class AppState {
             let session = try await coordinator.launch(profile: profile, installation: verified, runtime: runtime)
             isGameRunning = true
             status = "Game running (pid \(session.processIdentifier.map(String.init) ?? "?"))"
+            startLaunchWindowWatchers(session: session)
         } catch {
             isGameRunning = false
             let msg = error.localizedDescription
@@ -794,6 +801,36 @@ public final class AppState {
         // once the runtime confirms the process exited (terminal RuntimeEvent).
         isGameRunning = false
         status = "Stop requested"
+    }
+
+    /// Game-window and Microsoft-helper measurement (Task 1 pieces): one
+    /// watcher for the launched pid (`gameWindowVisible`), one for the
+    /// `mcpelauncher-webview` process (`microsoftHelperSpawned`), and once
+    /// that helper spawns a pid-keyed window watcher
+    /// (`microsoftWindowVisible`). All marks go into the supervisor's
+    /// in-flight `launch` timing session — this measures Microsoft-window
+    /// startup separately from the game window. Watchers self-cancel at their
+    /// timeout, and once the session ends the recorder ignores further marks,
+    /// so a late watcher can never corrupt the next session.
+    private func startLaunchWindowWatchers(session: LaunchSession) {
+        guard
+            let supervisor = services.runtimeLauncher as? ProcessLaunchSupervisor,
+            let pid = session.processIdentifier
+        else { return }
+        let recorder = supervisor.launchTiming
+        WindowAppearanceWatcher.watch(ownerPID: pid, stage: .gameWindowVisible, recorder: recorder)
+        WindowAppearanceWatcher.watchProcessSpawn(
+            processName: Self.microsoftHelperProcessName,
+            stage: .microsoftHelperSpawned,
+            recorder: recorder,
+            timeout: Self.microsoftHelperWatchTimeout
+        ) { helperPID in
+            WindowAppearanceWatcher.watch(
+                ownerPID: helperPID,
+                stage: .microsoftWindowVisible,
+                recorder: recorder
+            )
+        }
     }
 
     public func runDoctor() async {
@@ -1089,11 +1126,15 @@ public struct SettingsView: View {
             }
             Section("Xbox / Microsoft sign-in help") {
                 Text("""
-                If the in-game Microsoft sign-in gets stuck on "Face, fingerprint, PIN or security key", \
-                Microsoft is asking for a passkey that the game's login window cannot open \
-                (Microsoft blocks passkeys in embedded login windows). Fix it once on the account: \
-                open account.microsoft.com → Security → Ways to prove your identity → delete the passkey, \
-                then sign in again — the game will ask for your password instead and finish normally.
+                If the in-game Microsoft sign-in gets stuck on "Face, fingerprint, PIN or security key": \
+                Microsoft sometimes challenges embedded login windows with a passkey the window cannot open \
+                (known upstream limitation, minecraft-linux issue #1523) — your account is fine.\n\n\
+                Sign in with your password or PIN when offered, use "Use my password instead" or the other \
+                verification links in the challenge, or complete sign-in on another device where the \
+                challenge is available.\n\n\
+                If sign-in still fails: check Diagnostics → Doctor and the session log for \
+                mcpelauncher-webview errors. Llama error 0x80070057 means the helper's resources \
+                are broken — Settings → Runtime → Reinstall.
                 """)
                 .font(.caption)
                 .foregroundStyle(.secondary)

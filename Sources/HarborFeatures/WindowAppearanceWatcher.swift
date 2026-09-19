@@ -16,6 +16,10 @@ public enum WindowAppearanceWatcher {
     /// `processName` (resolved via `NSRunningApplication`) — appears, then records
     /// `stage` on `recorder`. Bounded by `timeout` (default 60 s). Runs off the
     /// main actor; the only main-actor hop is the `NSWorkspace` name→PID lookup.
+    /// The returned task is an optional cancellation handle: watchers also stop
+    /// on their own at the timeout, and marks after the recorder's session ended
+    /// are ignored, so discarding the task is safe.
+    @discardableResult
     public static func watch(
         processName: String? = nil,
         ownerPID: Int32? = nil,
@@ -36,6 +40,35 @@ public enum WindowAppearanceWatcher {
         }
     }
 
+    /// Polls `NSWorkspace.runningApplications` (main-actor hop, same
+    /// case-insensitive name resolution as window matching) until a process
+    /// whose localized or executable name matches `processName` is running,
+    /// then records `stage` and invokes `onSpawn` with the process identifier.
+    /// Use this for helper processes that mark a stage the moment they spawn,
+    /// before any window exists — e.g. to chain a pid-keyed `watch` for the
+    /// helper's window. Bounded by `timeout`; runs off the main actor.
+    @discardableResult
+    public static func watchProcessSpawn(
+        processName: String,
+        stage: LaunchTimingStage,
+        recorder: LaunchTimingRecorder,
+        timeout: TimeInterval = 60,
+        onSpawn: (@Sendable (Int32) -> Void)? = nil
+    ) -> Task<Void, Never> {
+        Task.detached(priority: .utility) {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                if Task.isCancelled { return }
+                if let pid = await runningPIDs(named: processName).first {
+                    await recorder.mark(stage)
+                    onSpawn?(pid)
+                    return
+                }
+                do { try await Task.sleep(for: pollInterval) } catch { return }
+            }
+        }
+    }
+
     // MARK: - Internals
 
     private static func targetWindowOnScreen(processName: String?, ownerPID: Int32?) async -> Bool {
@@ -48,14 +81,7 @@ public enum WindowAppearanceWatcher {
         // redacted still match. Small main-actor hop; NSWorkspace is main-only.
         var pidsForName: Set<Int32> = []
         if let processName, ownerPID == nil {
-            pidsForName = await MainActor.run {
-                NSWorkspace.shared.runningApplications
-                    .filter { app in
-                        app.localizedName?.caseInsensitiveCompare(processName) == .orderedSame
-                            || app.executableURL?.lastPathComponent.caseInsensitiveCompare(processName) == .orderedSame
-                    }
-                    .reduce(into: Set<Int32>()) { $0.insert($1.processIdentifier) }
-            }
+            pidsForName = await runningPIDs(named: processName)
         }
         for info in windowList {
             if matchesOwner(info, pid: ownerPID, name: processName) {
@@ -68,6 +94,19 @@ public enum WindowAppearanceWatcher {
             }
         }
         return false
+    }
+
+    /// PIDs of running applications whose localized or executable name matches
+    /// `processName` (case-insensitive). Main-actor hop: NSWorkspace is main-only.
+    private static func runningPIDs(named processName: String) async -> Set<Int32> {
+        await MainActor.run {
+            NSWorkspace.shared.runningApplications
+                .filter { app in
+                    app.localizedName?.caseInsensitiveCompare(processName) == .orderedSame
+                        || app.executableURL?.lastPathComponent.caseInsensitiveCompare(processName) == .orderedSame
+                }
+                .reduce(into: Set<Int32>()) { $0.insert($1.processIdentifier) }
+        }
     }
 
     /// True when the CGWindowList entry is owned by `pid` **or** an owner whose

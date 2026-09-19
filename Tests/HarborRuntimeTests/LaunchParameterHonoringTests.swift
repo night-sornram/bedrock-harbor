@@ -47,6 +47,17 @@ final class LaunchParameterHonoringTests: XCTestCase {
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         try Data("# qt.conf".utf8).write(to: macos.appendingPathComponent("qt.conf"))
         try Data("fake dylib".utf8).write(to: platforms.appendingPathComponent("libqcocoa.dylib"))
+        // Microsoft sign-in helper resources: the pre-launch readiness gate in
+        // makePlan refuses roots without them.
+        let webview = macos.appendingPathComponent("mcpelauncher-webview")
+        try executableBytes.write(to: webview)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: webview.path)
+        for rel in ["Resources/qml/QtQuick", "Resources/qml/QtWebEngine"] {
+            try fm.createDirectory(
+                at: root.appendingPathComponent(rel, isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
         return root
     }
 
@@ -225,5 +236,36 @@ final class LaunchParameterHonoringTests: XCTestCase {
             callerRoot.appendingPathComponent("MacOS/mcpelauncher-client").standardizedFileURL.path,
             "a same-named releaseID must not let discovery's layout override the caller's runtime root"
         )
+    }
+
+    // MARK: - pre-launch helper readiness
+
+    func testPlanRefusesRuntimeWithMissingMicrosoftHelperResources() async throws {
+        try writeInstalledPatch(names: ["1.26.40.0"])
+        let root = try makeUsableRuntimeRoot(name: "runtime", executableBytes: Data("exec".utf8))
+        // A root usable for the game but without the sign-in helper must fail the
+        // launch plan with a named piece and the reinstall remediation — not die
+        // later as an in-game Microsoft login error (Llama 0x80070057).
+        try FileManager.default.removeItem(at: root.appendingPathComponent("MacOS/mcpelauncher-webview"))
+        let game = try makeGameInstallation(name: "1.26.40.0")
+
+        let supervisor = ProcessLaunchSupervisor(paths: makePaths())
+        do {
+            _ = try await supervisor.prepareLaunchPlan(
+                profile: Profile(name: "Test"),
+                installation: makeInstallation(gameDir: game, versionName: "1.26.40.0"),
+                runtime: makeRuntime(root: root, releaseID: "harbor-test")
+            )
+            XCTFail("prepareLaunchPlan must refuse a runtime without the Microsoft sign-in helper")
+        } catch let error as HarborError {
+            guard case .unsupportedRuntime(let reason) = error else {
+                return XCTFail("expected unsupportedRuntime, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("mcpelauncher-webview"), "reason must name the missing piece: \(reason)")
+            XCTAssertTrue(
+                reason.contains("Settings → Runtime → Reinstall the launcher runtime"),
+                "reason must carry the remediation: \(reason)"
+            )
+        }
     }
 }

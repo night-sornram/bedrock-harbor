@@ -156,6 +156,41 @@ public enum HarborRuntimeInstaller {
         )
     }
 
+    /// Human-readable names of the Microsoft sign-in helper resources missing
+    /// from a runtime root. The helper (`mcpelauncher-webview`) needs its
+    /// executable, the Qt cocoa platform plugin, the executable-side qt.conf,
+    /// and the QML modules under `Resources/qml` (QtQuick for the helper UI,
+    /// QtWebEngine for both the webview module and the WebEngine core
+    /// resources, which ship under the same tree in the pinned DMG). Empty
+    /// means the helper has everything it needs to start.
+    public static func validateHelperResources(root: URL) -> [String] {
+        let fm = FileManager.default
+        var missing: [String] = []
+        if !fm.isExecutableFile(atPath: root.appendingPathComponent("MacOS/mcpelauncher-webview").path) {
+            missing.append("Microsoft sign-in helper (MacOS/mcpelauncher-webview)")
+        }
+        if !fm.fileExists(atPath: root.appendingPathComponent("PlugIns/platforms/libqcocoa.dylib").path) {
+            missing.append("Qt platform plugin (PlugIns/platforms/libqcocoa.dylib)")
+        }
+        if !fm.fileExists(atPath: root.appendingPathComponent("MacOS/qt.conf").path) {
+            missing.append("Qt configuration (MacOS/qt.conf)")
+        }
+        for (name, path) in [
+            ("QtQuick modules (Resources/qml/QtQuick)", "Resources/qml/QtQuick"),
+            ("QtWebEngine modules (Resources/qml/QtWebEngine)", "Resources/qml/QtWebEngine"),
+        ] where !isDirectoryPresent(root.appendingPathComponent(path, isDirectory: true)) {
+            missing.append(name)
+        }
+        return missing
+    }
+
+    /// True when `url` exists and is a directory (a stray file must not pass as
+    /// a QML module directory).
+    private static func isDirectoryPresent(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
     /// Pure file layout step: copy app bundle contents into a runtime root and
     /// write the runtime.json manifest LocalRuntimeDiscovery reads.
     public static func deploy(appContents: URL, destination: URL) throws {
@@ -212,6 +247,15 @@ public enum HarborRuntimeInstaller {
 
         guard fm.isExecutableFile(atPath: destination.appendingPathComponent("MacOS/mcpelauncher-client").path) else {
             throw HarborError.invalidPackage(reason: "mcpelauncher-client missing after launcher install")
+        }
+        // Same helper-resource gate the pre-launch readiness check runs: a
+        // deployed runtime whose Microsoft sign-in helper cannot start must be
+        // rejected at install time, not surface in-game as Llama 0x80070057.
+        let missingHelperResources = validateHelperResources(root: destination)
+        if !missingHelperResources.isEmpty {
+            throw HarborError.invalidPackage(
+                reason: "Launcher bundle is missing Microsoft sign-in resources: \(missingHelperResources.joined(separator: ", "))"
+            )
         }
     }
 

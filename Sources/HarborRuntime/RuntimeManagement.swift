@@ -438,6 +438,18 @@ public struct LocalRuntimeDiscovery: Sendable {
     private static let memory = DiscoveryMemory.shared
 }
 
+/// Lightweight pre-launch readiness gate: the same helper-resource checks the
+/// installer validates at deploy time, re-run as five cheap stats before every
+/// launch plan. A runtime damaged after install fails fast with a named remedy
+/// instead of dying in-game as a Microsoft login error (Llama 0x80070057).
+public enum RuntimeReadiness {
+    /// Human-readable names of missing Microsoft sign-in helper resources.
+    /// Empty means ready. No caching: called once per `prepareLaunchPlan`.
+    public static func missingPieces(runtimeRoot: URL) -> [String] {
+        HarborRuntimeInstaller.validateHelperResources(root: runtimeRoot)
+    }
+}
+
 public actor ProcessLaunchSupervisor: RuntimeLaunching {
     private static let recentSessionLimit = 10
 
@@ -448,14 +460,17 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
     private var stopRequested: Set<UUID> = []
     private var recentSessions: [LaunchSession] = []
     private let paths: HarborPaths
-    private let timing: LaunchTimingRecorder
+    /// The recorder that owns the in-flight `launch` timing session (begun in
+    /// `start(plan:)`). Public so the UI layer can add window-appearance marks
+    /// — game window, Microsoft sign-in window — into the same session.
+    public nonisolated let launchTiming: LaunchTimingRecorder
     private let hub = SessionEventHub()
 
     public init(paths: HarborPaths) {
         self.paths = paths
         // Timing is diagnostics-only and records one in-flight session at a time;
         // Harbor launches one game session at a time, so this matches reality.
-        self.timing = LaunchTimingRecorder(directory: paths.metadataDirectory)
+        self.launchTiming = LaunchTimingRecorder(directory: paths.metadataDirectory)
     }
 
     public func registerLayout(_ layout: MCLauncherClientLayout) {
@@ -546,6 +561,17 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         runtime: RuntimeInstallation,
         layout: MCLauncherClientLayout
     ) async throws -> LaunchPlan {
+        // Pre-launch readiness: five cheap stats per plan. Refuse before any
+        // directory or compatibility work so a broken runtime fails fast with
+        // the reinstall remedy.
+        let missingHelperResources = RuntimeReadiness.missingPieces(runtimeRoot: layout.runtimeRootURL)
+        if !missingHelperResources.isEmpty {
+            throw HarborError.unsupportedRuntime(
+                reason: "Runtime is missing Microsoft sign-in resources: "
+                    + missingHelperResources.joined(separator: ", ")
+                    + " — Settings → Runtime → Reinstall the launcher runtime"
+            )
+        }
         try paths.ensurePrivateDirectoryLayout()
         let root = paths.gameDataDirectory.appendingPathComponent(profile.dataRootID, isDirectory: true)
         let cache = paths.gameCache.appendingPathComponent(profile.dataRootID, isDirectory: true)
@@ -622,7 +648,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         try paths.ensurePrivateDirectoryLayout()
         try FileManager.default.createDirectory(at: paths.sessionLogs, withIntermediateDirectories: true)
         let sessionID = UUID()
-        await timing.begin(kind: "launch", runtimeRelease: plan.runtimeReleaseID)
+        await launchTiming.begin(kind: "launch", runtimeRelease: plan.runtimeReleaseID)
         let logURL = paths.sessionLogs.appendingPathComponent("session-\(sessionID.uuidString).log")
         var session = LaunchSession(
             id: sessionID,
@@ -644,7 +670,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         process.standardError = err
         process.standardInput = FileHandle.nullDevice
         do { try process.run() } catch {
-            await timing.end(outcome: "failed")
+            await launchTiming.end(outcome: "failed")
             throw HarborError.unsupportedRuntime(reason: "Process failed to start: \(error.localizedDescription)")
         }
         session.state = .running
@@ -652,7 +678,7 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
         session.startedAt = Date()
         active[sessionID] = session
         processes[sessionID] = process
-        await timing.mark(.processLaunched)
+        await launchTiming.mark(.processLaunched)
 
         // Nonblocking IO: handlers run on dispatch queues, never on this actor
         // or the cooperative pool.
@@ -701,8 +727,8 @@ public actor ProcessLaunchSupervisor: RuntimeLaunching {
             }
             await hub.retainOnly(Set(recentSessions.map(\.id)))
 
-            await timing.mark(.sessionEnded)
-            await timing.end(outcome: requestedStop ? "cancelled" : (s.state == .exited ? "ok" : "failed"))
+            await launchTiming.mark(.sessionEnded)
+            await launchTiming.end(outcome: requestedStop ? "cancelled" : (s.state == .exited ? "ok" : "failed"))
             await hub.emit(
                 RuntimeEvent(
                     sessionID: sessionID,
